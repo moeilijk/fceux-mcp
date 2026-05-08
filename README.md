@@ -45,9 +45,21 @@ Flags:
 - `--host HOST` — bridge host (default 127.0.0.1).
 - `--bridge-lua PATH` — override `bridge.lua` location (defaults to the one next to the package).
 
-## Claude Desktop configuration
+## Claude Code configuration
 
-Minimum (server picks the bundled dummy ROM, agent loads real ROMs on demand):
+Two ways to register the server with Claude Code.
+
+**Via the CLI (easiest)** — adds the server to your user-scope config:
+
+```sh
+# Minimum: server picks the bundled dummy ROM, agent loads real ROMs on demand
+claude mcp add fceux /absolute/path/to/fceux-mcp/.venv/bin/fceux-mcp
+
+# Or pin a starter ROM
+claude mcp add fceux /absolute/path/to/fceux-mcp/.venv/bin/fceux-mcp -- --rom /absolute/path/to/your.nes
+```
+
+**Via `.mcp.json` at the root of a project** — scopes the server to that project:
 
 ```json
 {
@@ -59,18 +71,9 @@ Minimum (server picks the bundled dummy ROM, agent loads real ROMs on demand):
 }
 ```
 
-Or pin a starter ROM:
+Add `"args": ["--rom", "/absolute/path/to/your.nes"]` to pin a starter ROM.
 
-```json
-{
-  "mcpServers": {
-    "fceux": {
-      "command": "/absolute/path/to/fceux-mcp/.venv/bin/fceux-mcp",
-      "args": ["--rom", "/absolute/path/to/your.nes"]
-    }
-  }
-}
-```
+After either, restart `claude` (or run `/mcp` inside a session) and the 26 fceux tools should appear.
 
 ## Notes
 
