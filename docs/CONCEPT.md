@@ -59,7 +59,7 @@ Alternative considered and rejected: an `advance_until(condition)` tool that res
 
 ### Screen capture format — decided: PNG via temp file path
 
-The bridge calls `gui.savescreenshotas("/tmp/fceux-mcp-cap.png")` (path optionally overridable per request) and returns the path. The MCP server reads the file and forwards the bytes as an MCP image content block to the client. FCEUX's PNG encoder handles compression, so the payload is small (typical NES frame compresses to under 10 KB) and the bridge handler stays trivial.
+The bridge calls `gui.savescreenshotas` with a default path under the platform tmp dir — `/tmp/fceux-mcp-cap.png` on macOS/Linux, `%TEMP%\fceux-mcp-cap.png` on Windows — and returns the resolved path. Per-request override available via `params.path`. The MCP server reads the file and forwards the bytes as an MCP image content block to the client. FCEUX's PNG encoder handles compression, so the payload is small (typical NES frame compresses to under 10 KB) and the bridge handler stays trivial.
 
 Alternatives considered: inline raw RGBA via `gui.gdscreenshot` (no disk I/O but ~330 KB base64 payload per frame and adds a Pillow dependency); inline PNG bytes read back by the bridge (small payload, but bridge has to do file I/O and base64 in Lua, more moving parts). The temp-file approach keeps the bridge simple and lets the MCP server own all binary handling.
 

@@ -20,6 +20,16 @@ local function script_dir()
   return (src:match("@(.*/)")) or "./"
 end
 
+-- Default path for files we drop in the platform tmp dir. /tmp is universal
+-- on macOS/Linux; on Windows we read %TEMP% / %TMP% with a sane fallback.
+local function default_tmp_path(name)
+  if package.config:sub(1, 1) == "\\" then
+    local base = os.getenv("TEMP") or os.getenv("TMP") or "C:\\Windows\\Temp"
+    return base .. "\\" .. name
+  end
+  return "/tmp/" .. name
+end
+
 local function detect_platform()
   local f = io.popen("uname -sm 2>/dev/null")
   if not f then return "macos-arm64" end
@@ -157,7 +167,7 @@ end
 -- file exists by the time the response is sent. Side effect: capturing the
 -- screen ticks the emulator by 1 frame.
 handlers["gui.screenshot"] = function(p)
-  local path = "/tmp/fceux-mcp-cap.png"
+  local path = default_tmp_path("fceux-mcp-cap.png")
   if type(p) == "table" and type(p.path) == "string" and #p.path > 0 then
     path = p.path
   end
