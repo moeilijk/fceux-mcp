@@ -1,0 +1,157 @@
+# Architecture
+
+This document describes how `bridge.lua` is loaded into FCEUX, how it exposes FCEUX's Lua API over TCP, and how the MCP server talks to it. Design rationale lives in [`CONCEPT.md`](./CONCEPT.md); the wrapped Lua surface is in [`FLUA-FUNCTIONS.md`](./FLUA-FUNCTIONS.md).
+
+## Process model
+
+```
+MCP client (Claude, etc.)
+        │  MCP (JSON-RPC over stdio)
+        ▼
+   MCP server  ───── TCP (loopback, line-framed JSON) ─────►  FCEUX
+   (this repo)                                               + bridge.lua
+                                                             + vendor/luasocket
+```
+
+Two processes. They are independent — FCEUX can be launched first and the MCP server later, or vice versa, as long as they agree on a port.
+
+## Launch
+
+```sh
+fceux --loadlua bridge.lua <rom>
+```
+
+FCEUX boots, loads the ROM, and hands `bridge.lua` to its statically-linked Lua 5.1 interpreter. From that point on, `bridge.lua` runs inside FCEUX's Lua VM with full access to `emu.*`, `memory.*`, `joypad.*`, `gui.*`, etc.
+
+## Loading LuaSocket from `vendor/`
+
+FCEUX's embedded Lua does not ship LuaSocket. We bundle pre-built LuaSocket binaries under `vendor/luasocket/<platform>/` (see [`vendor/luasocket/README.md`](../vendor/luasocket/README.md)) and load them at script startup.
+
+### Step 1 — extend Lua's module search paths
+
+Before any `require`, `bridge.lua` prepends the vendor location to two globals:
+
+- `package.cpath` — where Lua looks for **C extension modules** (`.so` files)
+- `package.path` — where Lua looks for **pure-Lua modules** (`.lua` files)
+
+```lua
+local here   = debug.getinfo(1, "S").source:match("@(.*/)")
+local VENDOR = here .. "vendor/luasocket/macos-arm64"
+
+package.cpath = VENDOR .. "/lib/lua/5.1/?.so;"
+             .. VENDOR .. "/lib/lua/5.1/?/core.so;"
+             .. package.cpath
+
+package.path  = VENDOR .. "/share/lua/5.1/?.lua;"
+             .. VENDOR .. "/share/lua/5.1/?/init.lua;"
+             .. package.path
+```
+
+The `?` is Lua's path placeholder — it is replaced by the dotted module name with `.` → `/`.
+
+### Step 2 — `require("socket")` walks the tree
+
+```lua
+local socket = require("socket")
+```
+
+What Lua does:
+
+1. Looks in `package.path` for `socket` → finds `vendor/luasocket/macos-arm64/share/lua/5.1/socket.lua`. Loads and runs it.
+2. `socket.lua` requires `socket.core`.
+3. For `socket.core`, Lua looks in `package.cpath` and finds `lib/lua/5.1/socket/core.so` (because `?/core.so` matches `socket/core.so`). Calls `dlopen` on it.
+4. Lua then calls `luaopen_socket_core` from the freshly opened `.so`. That C function registers all the actual socket functions (`bind`, `connect`, `tcp`, …) into FCEUX's Lua state.
+5. `socket.lua` finishes wiring things up and returns the table.
+
+`socket/http.lua`, `socket/url.lua`, `mime`, `ltn12`, etc. are bundled but only loaded if something `require`s them — for the TCP bridge we only need `socket.core` and `socket.lua`.
+
+### Step 3 — why the `.so` binds to FCEUX's Lua
+
+Subtle but important: our vendored `core.so` was compiled against headers from the Lua 5.1.5 source tarball, but at runtime it has to use FCEUX's *statically-linked* Lua. This works because:
+
+- On macOS, Lua C modules are linked with `-undefined dynamic_lookup` (visible in our build log: `gcc … -bundle -undefined dynamic_lookup -osocket-3.0.0.so`).
+- That flag tells the linker: "don't resolve `lua_pushstring`, `lua_gettop`, etc. at link time — leave them undefined".
+- When FCEUX `dlopen`s the bundle, those undefined symbols get bound against whatever Lua symbols already exist in the host process — which is FCEUX's static Lua.
+
+So the headers we built against just defined the C-API contract; the actual implementation comes from FCEUX. As long as both sides are Lua 5.1.x (the C-API is stable across patch releases), it works.
+
+LuaSocket reference: <https://lunarmodules.github.io/luasocket/reference.html>.
+
+## Frame loop and TCP server
+
+`bridge.lua` follows the standard FCEUX scripting idiom:
+
+```lua
+while true do
+  pump_socket()      -- accept new clients, drain pending requests, send replies
+  emu.frameadvance() -- yield to FCEUX for one frame
+end
+```
+
+`emu.frameadvance` blocks until FCEUX has rendered the next frame (~16.6 ms at NTSC 60 Hz), giving the bridge a natural tick. `pump_socket()` is non-blocking — it polls the listening socket for new clients and drains whatever bytes are already in each client's receive buffer.
+
+Trade-offs of this design:
+
+- **Latency.** A request arriving just after `emu.frameadvance` returns will be processed immediately; one arriving just before will wait up to one frame. Worst case: ~16 ms.
+- **Throughput.** Many requests can be processed per frame (the pump drains everything available), so batching is cheap.
+- **Backpressure.** If the agent sends faster than one frame can drain, requests queue in the OS socket buffer. That's fine for typical tool-call rates.
+
+## Wire protocol
+
+**Line-framed JSON**, one message per line, both directions. Chosen for v1 because it's trivial to test by hand with `nc`. We can upgrade to length-prefix framing later without changing the message shape.
+
+### Request
+
+```json
+{"id": 1, "method": "memory.readbyte", "params": {"address": 0x100}}
+```
+
+- `id` — opaque; echoed back in the response. Lets clients pipeline requests.
+- `method` — dotted name like `emu.framecount`, `memory.readbyte`, `joypad.set`.
+- `params` — object; per-method.
+
+### Response (success)
+
+```json
+{"id": 1, "result": 42}
+```
+
+### Response (error)
+
+```json
+{"id": 1, "error": {"code": "method_not_found", "message": "no handler for 'memory.foo'"}}
+```
+
+Error codes used so far: `parse_error`, `method_not_found`, `invalid_params`, `internal_error`.
+
+## Dispatch
+
+`bridge.lua` holds a flat table of handlers keyed by method name. Each handler takes `params` (a Lua table) and returns either a result value or raises an error via `error(msg)`. The pump catches errors with `pcall` and converts them to the error response shape.
+
+Initial handler set (v1):
+
+| Method | Description |
+| --- | --- |
+| `ping` | Smoke test; returns `"pong"` |
+| `emu.framecount` | Current frame number |
+| `emu.pause` / `emu.unpause` | Pause / resume emulation |
+| `emu.message` | Show a message in FCEUX's overlay |
+| `memory.readbyte` | Read one byte from CPU RAM |
+| `memory.readbyterange` | Read N bytes; returned as a numeric array |
+| `memory.writebyte` | Write one byte |
+| `joypad.get` | Read controller state for a player |
+| `joypad.set` | Force controller state for a player |
+
+Adding a new method is a one-line entry in the dispatch table — see `bridge.lua`.
+
+## FCEUX-specific quirks (gotchas we hit during bring-up)
+
+- **Non-standard `tostring`.** FCEUX 2.6.6's embedded Lua has a `tostring` that stringifies *all* its arguments and concatenates them, like `print` does — `tostring(true, {a=1}) -> "true {a=1}"`. Standard Lua 5.1 ignores extra args. rxi/json originally mapped `boolean` directly to the global `tostring`, so the encoder's internal `stack` table leaked into encoded output. The vendored copy in `vendor/json/json.lua` patches this with a one-arg wrapper; comment in the file marks the change.
+- **`emu.pause()` blocks the frame loop.** Once FCEUX is paused, `emu.frameadvance()` blocks indefinitely waiting for the next frame, so the bridge's `pump()` would never run again — including `emu.unpause`. To avoid that, `bridge.lua` does **not** call FCEUX's `emu.pause()`. Instead, the `emu.pause` / `emu.unpause` / `emu.paused` handlers manipulate a bridge-local `paused` flag that suppresses `emu.frameadvance()` in the main loop. The agent gets the same observable effect (no frames advance) and the bridge stays responsive.
+
+## Limitations / future work
+
+- **Length-prefix framing.** Line-framed is fine while everything is small; binary payloads (e.g. screen captures) want length-prefix. Easy upgrade.
+- **Async / streaming responses.** Today it's strict request → response. Memory-watch hooks and frame-by-frame screen feeds will need server-pushed messages.
+- **Cross-platform vendor builds.** Only `macos-arm64` LuaSocket is shipped. Linux and Windows artifacts are not yet built.
+- **Hot reload.** No way to restart `bridge.lua` without restarting FCEUX. Not a v1 concern.
