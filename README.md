@@ -2,8 +2,6 @@
 
 An MCP server that exposes the [FCEUX](https://fceux.com/) NES emulator's Lua API as MCP tools, so an LLM agent can read memory, send controller input, advance frames, manage savestates, and capture the screen.
 
-See [`docs/CONCEPT.md`](./docs/CONCEPT.md) for the design. The Lua surface being wrapped is documented in [`docs/FLUA-FUNCTIONS.md`](./docs/FLUA-FUNCTIONS.md).
-
 ## How it works
 
 The MCP server (Python) spawns FCEUX with `fceux --loadlua bridge.lua <rom>`. The bridge script runs inside FCEUX's embedded Lua 5.1 interpreter, loads [LuaSocket](https://lunarmodules.github.io/luasocket/) from `vendor/`, opens a loopback TCP port, and dispatches JSON commands to FCEUX's `emu.*` / `memory.*` / `joypad.*` libraries. The server speaks MCP (JSON-RPC over stdio) to the client and TCP to the bridge.
@@ -32,17 +30,36 @@ This installs the `fceux-mcp` console script into `.venv/bin/`.
 ## Run
 
 ```sh
+# With a starter ROM:
 .venv/bin/fceux-mcp --rom /path/to/your.nes
+
+# Or without — boots on a bundled no-op dummy ROM; agent loads a real
+# ROM via emu_loadrom as its first action:
+.venv/bin/fceux-mcp
 ```
 
 Flags:
 
-- `--rom PATH` — required when no bridge is already running; ignored if attaching to an existing bridge.
+- `--rom PATH` — optional. Without it, FCEUX boots on a bundled minimal NES ROM (`fceux_mcp/data/dummy.nes`) and the agent is expected to switch to a real ROM via the `emu_loadrom` tool. With it, that ROM is the starter; the agent can still switch later. Ignored entirely if attaching to an already-running bridge.
 - `--port N` — bridge TCP port (default 9999). Also overridable via `FCEUX_BRIDGE_PORT` for the bridge side.
 - `--host HOST` — bridge host (default 127.0.0.1).
 - `--bridge-lua PATH` — override `bridge.lua` location (defaults to the one next to the package).
 
 ## Claude Desktop configuration
+
+Minimum (server picks the bundled dummy ROM, agent loads real ROMs on demand):
+
+```json
+{
+  "mcpServers": {
+    "fceux": {
+      "command": "/absolute/path/to/fceux-mcp/.venv/bin/fceux-mcp"
+    }
+  }
+}
+```
+
+Or pin a starter ROM:
 
 ```json
 {

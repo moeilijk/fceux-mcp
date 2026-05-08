@@ -26,6 +26,13 @@ DEFAULT_PORT = 9999
 BRIDGE_READY_TIMEOUT_SEC = 10.0
 RECV_BUF = 4096
 
+# Bundled minimal NES ROM used as a starter when the user didn't supply
+# --rom. FCEUX 2.6.6 cannot load a ROM via emu.loadrom from a no-ROM state
+# (the emulator process exits), but emu.loadrom from one loaded ROM to
+# another works fine — so we always boot FCEUX with *something* and let the
+# agent switch via emu_loadrom. See fceux_mcp/data/_generate_dummy.py.
+BUNDLED_DUMMY_ROM = Path(__file__).resolve().parent / "data" / "dummy.nes"
+
 
 # ---------------------------------------------------------------------------
 # Bridge client
@@ -136,17 +143,17 @@ def wait_for_port(host: str, port: int, timeout_sec: float, interval: float = 0.
     return False
 
 
-def spawn_fceux(rom: Path, bridge_lua: Path, port: int) -> subprocess.Popen:
-    if not rom.exists():
-        raise FileNotFoundError(f"ROM not found: {rom}")
+def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int) -> subprocess.Popen:
     if not bridge_lua.exists():
         raise FileNotFoundError(f"bridge.lua not found: {bridge_lua}")
+    argv = ["fceux", "--loadlua", str(bridge_lua)]
+    if rom is not None:
+        if not rom.exists():
+            raise FileNotFoundError(f"ROM not found: {rom}")
+        argv.append(str(rom))
     env = {**os.environ, "FCEUX_BRIDGE_PORT": str(port)}
     return subprocess.Popen(
-        ["fceux", "--loadlua", str(bridge_lua), str(rom)],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
@@ -381,13 +388,14 @@ def main() -> int:
     if is_port_open(args.host, args.port):
         print(f"[fceux-mcp] attaching to existing bridge on {args.host}:{args.port}", file=sys.stderr)
     else:
+        rom = args.rom or BUNDLED_DUMMY_ROM
         if args.rom is None:
-            print("[fceux-mcp] no bridge listening on "
-                  f"{args.host}:{args.port} and --rom not provided; nothing to do",
+            print("[fceux-mcp] launching FCEUX with bundled dummy ROM "
+                  "(agent should call emu_loadrom to switch to a real ROM)",
                   file=sys.stderr)
-            return 2
-        print(f"[fceux-mcp] launching FCEUX with {args.rom}", file=sys.stderr)
-        fceux_proc = spawn_fceux(args.rom, bridge_lua, args.port)
+        else:
+            print(f"[fceux-mcp] launching FCEUX with {rom}", file=sys.stderr)
+        fceux_proc = spawn_fceux(rom, bridge_lua, args.port)
         if not wait_for_port(args.host, args.port, BRIDGE_READY_TIMEOUT_SEC):
             print(f"[fceux-mcp] bridge did not start within {BRIDGE_READY_TIMEOUT_SEC}s",
                   file=sys.stderr)

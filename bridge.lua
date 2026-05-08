@@ -203,6 +203,12 @@ handlers["emu.loadrom"] = function(p)
     bad_params("emu.loadrom: params.filename (string) required")
   end
   emu.loadrom(p.filename)
+  -- emu.loadrom is deferred: the actual ROM swap takes effect on the next
+  -- frame render. Advance one frame here to flush the swap so subsequent
+  -- reads (rom.getfilename, memory.*) see the new ROM. Same pattern as
+  -- gui.savescreenshotas. Side effect: each ROM switch ticks the timeline
+  -- by one frame.
+  emu.frameadvance()
   -- FCEUX silently falls back to the most-recent ROM if the path can't
   -- be loaded, so report what's actually loaded now.
   return { filename = rom.getfilename(), framecount = emu.framecount() }
@@ -393,7 +399,11 @@ end
 -- Methods whose handlers internally call emu.frameadvance (which yields).
 -- Lua 5.1 cannot yield across a pcall boundary, so these run unprotected.
 -- Their handlers must be written so they never error in practice.
-local YIELDING_METHODS = { ["emu.step"] = true, ["gui.screenshot"] = true }
+local YIELDING_METHODS = {
+  ["emu.step"] = true,
+  ["emu.loadrom"] = true,    -- frame-advances after load to flush the swap
+  ["gui.screenshot"] = true,
+}
 
 -- Strip Lua's "<source>:<line>: " prefix from a runtime error message.
 local function clean_lua_error(s)
@@ -521,7 +531,11 @@ end
 -- Prime: the first emu.frameadvance after a script loads acts as a yield-only
 -- warm-up under FCEUX 2.6.6 (it does not bump emu.framecount), so do it once
 -- here before any agent-driven step would otherwise see an off-by-one.
-emu.frameadvance()
+-- Skipped if no ROM is loaded yet — frameadvance with no ROM hangs forever.
+-- The emu.loadrom handler does the same priming for each new ROM.
+if emu.emulating() then
+  emu.frameadvance()
+end
 
 while true do
   pump()
