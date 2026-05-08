@@ -329,6 +329,33 @@ def build_server(client: BridgeClient) -> FastMCP:
             params["color"] = color
         return client.call("gui.pixel", params)
 
+    @mcp.tool()
+    def lua_exec(code: str) -> Any:
+        """Run arbitrary Lua inside FCEUX. The full FCEUX Lua API is in
+        scope (emu.*, memory.*, ppu.*, joypad.*, gui.*, …) — see
+        docs/FLUA-FUNCTIONS.md.
+
+        Use `return EXPR` to send back a value. Returned values must be
+        JSON-serializable: tables / numbers / strings / booleans / nil.
+        Functions and userdata error out as lua_error.
+
+        Use this for batched reads, ad-hoc queries, or APIs that aren't
+        wrapped as typed tools yet. For common operations the typed
+        tools are preferable — they document themselves to the agent
+        and are validated.
+
+        Caveat: cannot call emu.frameadvance() from here (Lua 5.1
+        forbids yielding across the pcall this tool runs inside). Call
+        the typed `emu_step` tool to advance frames, then read state
+        via lua_exec.
+
+        Examples:
+            lua_exec("return memory.readbyte(0x100)")
+            lua_exec("return {x = memory.readbyte(0x10), y = memory.readbyte(0x11)}")
+            lua_exec("local t={} for i=0,15 do t[i+1]=memory.readbyte(i) end return t")
+        """
+        return client.call("lua.exec", {"code": code})
+
     return mcp
 
 

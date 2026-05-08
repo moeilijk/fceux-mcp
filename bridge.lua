@@ -351,6 +351,41 @@ handlers["gui.pixel"] = function(p)
   return true
 end
 
+-- Run arbitrary Lua inside FCEUX. The agent's chunk uses `return EXPR` to
+-- send back a value; the value must be JSON-serializable (table / number /
+-- string / boolean / nil — no functions or userdata). The full FCEUX Lua
+-- API is in scope: emu.*, memory.*, ppu.*, joypad.*, gui.*, etc.
+--
+-- emu.frameadvance is intentionally shadowed: lua.exec runs inside the
+-- dispatcher's pcall, and even an *attempted* yield across pcall corrupts
+-- FCEUX's frame-loop state (subsequent emu.frameadvance calls hang). The
+-- shadow errors before any yield is attempted, keeping FCEUX healthy.
+-- Agents wanting to advance frames should call the typed `emu.step`
+-- handler, which runs unprotected and yields safely.
+local function make_safe_emu()
+  return setmetatable({
+    frameadvance = function()
+      error("emu.frameadvance cannot be called from lua.exec; "
+            .. "use the emu.step handler to advance frames")
+    end,
+  }, { __index = emu })
+end
+
+handlers["lua.exec"] = function(p)
+  if type(p) ~= "table" or type(p.code) ~= "string" then
+    bad_params("lua.exec: params.code (string) required")
+  end
+  local fn, perr = loadstring(p.code, "agent_code")
+  if not fn then
+    bad_params("lua.exec: parse error: " .. tostring(perr))
+  end
+  -- Sandboxed env: agent sees our shimmed emu table; all other globals
+  -- (memory, joypad, gui, etc.) fall through to _G via __index.
+  local env = setmetatable({ emu = make_safe_emu() }, { __index = _G })
+  setfenv(fn, env)
+  return fn()
+end
+
 ----------------------------------------------------------------------
 -- JSON request / response
 ----------------------------------------------------------------------
@@ -461,7 +496,18 @@ local function pump()
     rxbuf = rxbuf:sub(nl + 1)
     if #line > 0 then
       local resp = handle_line(line)
-      local encoded = json.encode(resp) .. "\n"
+      -- Encode in a pcall: a handler may return a non-JSON-serializable value
+      -- (e.g. lua.exec returning a userdata or function). Fall back to an
+      -- error response in that case rather than crashing the main loop.
+      local ok, encoded = pcall(json.encode, resp)
+      if not ok then
+        encoded = json.encode({
+          id = resp.id,
+          error = { code = "lua_error",
+                    message = "result is not JSON-serializable: " .. tostring(encoded) }
+        })
+      end
+      encoded = encoded .. "\n"
       local _, serr = client:send(encoded)
       if serr then close_client("send: " .. serr); return end
     end

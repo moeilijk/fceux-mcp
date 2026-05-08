@@ -193,6 +193,12 @@ Initial handler set (v1):
 | `rom.getfilename` | Base filename of the loaded ROM |
 | `rom.gethash` (`type=md5\|base64`) | Hash of the loaded ROM |
 
+**Escape hatch**
+
+| Method | Description |
+| --- | --- |
+| `lua.exec` (`code`) | Run an arbitrary Lua chunk inside FCEUX. The full FCEUX Lua API is in scope; `return EXPR` sends a value back. Use for batched reads, ad-hoc queries, and APIs not yet wrapped as typed handlers. `emu.frameadvance` is shadowed (would corrupt FCEUX state inside our pcall — see gotchas) — use `emu.step` for frames |
+
 The bridge starts **paused** so an LLM agent owns the timeline; frames only tick when the agent calls `emu.step`. Switch to real-time mode with `emu.unpause` (frames tick at NTSC ~60 Hz from the bridge's main loop).
 
 Adding a new method is a one-line entry in the dispatch table — see `bridge.lua`.
@@ -206,6 +212,9 @@ Adding a new method is a one-line entry in the dispatch table — see `bridge.lu
 - **`gui.savescreenshotas` is deferred.** Calling it queues the PNG write for the next frame render; if the bridge stays paused, the file is never written. `gui.screenshot` therefore advances exactly one frame after `savescreenshotas` to flush the write, and returns the post-advance framecount alongside the path so the agent knows what frame was captured.
 - **`savestate.persist` crashes the embedded Lua.** The docs say it makes a state survive across loads, but calling it under FCEUX 2.6.6 takes the bridge down. The savestate handlers therefore don't call it — anonymous saves end up single-use (FCEUX deletes the state on load), and slots stay in-memory rather than being written to disk.
 - **`savestate.object(N)` returns a fresh handle each call.** A save through one handle and a load through another (even for the same slot N) operate on different objects — the load sees no state. The handlers cache one savestate object per slot for the script's lifetime so save and load see the same handle, which makes slots 1-10 reusable across many save/load cycles within a session.
+- **An *attempted* yield across pcall corrupts FCEUX's frame loop.** Calling `emu.frameadvance` from inside a pcall'd handler not only fails with `attempt to yield across metamethod/C-call boundary` (expected for Lua 5.1), but also leaves FCEUX in a state where subsequent `emu.frameadvance` calls hang indefinitely. The dispatcher therefore runs handlers that legitimately need to yield (`emu.step`, `gui.screenshot`) outside pcall via `YIELDING_METHODS`. For `lua.exec`, which runs *inside* pcall and lets the agent write arbitrary code, we shadow `emu.frameadvance` in a sandboxed environment so it errors *before* any yield is attempted — keeping FCEUX healthy.
+
+The Python server side has its own response-encode hardening: the bridge now wraps `json.encode(resp)` in pcall and falls back to a `lua_error` response if a handler ever returns something non-JSON-serializable (e.g. a userdata leaked from a `lua.exec` chunk). Without this, the encode would throw out of the main loop and crash the bridge.
 
 ## Limitations / future work
 
