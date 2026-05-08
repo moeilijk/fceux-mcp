@@ -122,7 +122,17 @@ Trade-offs of this design:
 {"id": 1, "error": {"code": "method_not_found", "message": "no handler for 'memory.foo'"}}
 ```
 
-Error codes used so far: `parse_error`, `method_not_found`, `invalid_params`, `internal_error`.
+Error codes:
+
+| Code | Meaning | Source |
+| --- | --- | --- |
+| `parse_error` | Bridge couldn't parse the request line | bridge.lua |
+| `method_not_found` | Unknown method | bridge.lua |
+| `invalid_params` | Handler validation failure (raise via `bad_params(msg)`) | bridge.lua |
+| `lua_error` | Unexpected Lua runtime error in a handler (`error("…")` or panic). The `file:line:` prefix is stripped before sending. | bridge.lua |
+| `bridge_unreachable` | Transport failure — never sent over the wire; raised by the Python `BridgeClient` when connect / send / recv fails | server |
+
+Server-side, `BridgeError` carries `code` and `message` attributes; `BridgeUnreachable` is a subclass for transport failures so callers can distinguish "FCEUX is gone" from "I sent bad input."
 
 ## Dispatch
 

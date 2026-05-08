@@ -74,6 +74,20 @@ Because the agent owns the timeline (paused-by-default + `emu.step`), the user h
 
 Alternative considered: user-launched (server only attaches). Cleaner separation of GUI lifecycle but two-step setup, and forces the user to manage a process they otherwise don't interact with much. Kept as a fallback (server attaches if a bridge is already up).
 
+### Error model — decided: typed codes end-to-end
+
+Bridge responses are either `{id, result}` or `{id, error: {code, message}}`. The codes are a fixed taxonomy that the Python server preserves and surfaces to the MCP client:
+
+| Code | Meaning | Source |
+| --- | --- | --- |
+| `parse_error` | Bridge couldn't parse the JSON request | bridge.lua |
+| `method_not_found` | Unknown method name | bridge.lua |
+| `invalid_params` | Handler-level validation failure (wrong type, missing field, …) | bridge.lua |
+| `lua_error` | Unexpected Lua-runtime failure inside a handler | bridge.lua |
+| `bridge_unreachable` | TCP connect / send / recv failed (FCEUX gone, port closed, …) | server |
+
+Bridge handlers raise `invalid_params` via a small `bad_params(msg)` helper that throws a typed table; the dispatcher recognizes the shape and emits the right code. Plain `error("…")` (or runtime panics) get wrapped as `lua_error` with the `file:line:` prefix stripped from the message so the client sees clean text. Transport failures from the server side raise `BridgeUnreachable` so the agent / user can distinguish "FCEUX crashed" from "I sent bad input."
+
 ## Tool surface (initial scope)
 
 Wrap the most useful Lua libraries first; defer the rest until there's a real need.
@@ -105,4 +119,4 @@ v1 should target the long-lived session — it's what makes "play this game" fea
 
 ## Open questions
 
-- **Error model.** Lua errors inside FCEUX need to surface as structured MCP tool errors, not silent failures.
+(none currently — see commit history for resolved questions; new ones will be added here as they come up.)

@@ -32,7 +32,20 @@ RECV_BUF = 4096
 # ---------------------------------------------------------------------------
 
 class BridgeError(RuntimeError):
-    pass
+    """Structured error from the bridge. `code` is one of: parse_error,
+    method_not_found, invalid_params, lua_error, bridge_unreachable."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class BridgeUnreachable(BridgeError):
+    """Server-side error for transport failures (FCEUX/bridge gone)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("bridge_unreachable", reason)
 
 
 class BridgeClient:
@@ -63,7 +76,10 @@ class BridgeClient:
 
     def call(self, method: str, params: dict | None = None) -> Any:
         if self._sock is None:
-            self.connect()
+            try:
+                self.connect()
+            except OSError as e:
+                raise BridgeUnreachable(f"connect failed: {e}") from e
         rid = self._next_id
         self._next_id += 1
         req: dict[str, Any] = {"id": rid, "method": method}
@@ -76,16 +92,16 @@ class BridgeClient:
             resp_line = self._recv_line()
         except OSError as e:
             self.close()
-            raise BridgeError(f"transport error: {e}") from e
+            raise BridgeUnreachable(f"transport error: {e}") from e
 
         try:
             msg = json.loads(resp_line)
         except json.JSONDecodeError as e:
-            raise BridgeError(f"invalid response: {e}: {resp_line!r}") from e
+            raise BridgeError("lua_error", f"invalid bridge response: {e}: {resp_line!r}") from e
 
         if "error" in msg:
             err = msg["error"]
-            raise BridgeError(f"{err.get('code', 'unknown')}: {err.get('message')}")
+            raise BridgeError(err.get("code", "lua_error"), err.get("message", ""))
         return msg.get("result")
 
     def _recv_line(self) -> str:
@@ -93,7 +109,7 @@ class BridgeClient:
         while b"\n" not in self._buf:
             chunk = self._sock.recv(RECV_BUF)
             if not chunk:
-                raise BridgeError("bridge closed connection")
+                raise BridgeUnreachable("bridge closed connection")
             self._buf += chunk
         line, _, self._buf = self._buf.partition(b"\n")
         return line.decode()

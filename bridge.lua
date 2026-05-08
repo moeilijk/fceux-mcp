@@ -64,6 +64,13 @@ local json   = require("json")
 
 local handlers = {}
 
+-- Throw a structured invalid_params error from a handler. pcall wraps the
+-- thrown table as the second return; dispatch() recognizes the shape and
+-- surfaces it as { code = "invalid_params", message = ... }.
+local function bad_params(msg)
+  error({ code = "invalid_params", message = msg })
+end
+
 handlers["ping"] = function(_)
   return "pong"
 end
@@ -112,7 +119,7 @@ end
 
 handlers["emu.message"] = function(p)
   if type(p) ~= "table" or type(p.text) ~= "string" then
-    error("emu.message: params.text (string) required")
+    bad_params("emu.message: params.text (string) required")
   end
   emu.message(p.text)
   return true
@@ -120,7 +127,7 @@ end
 
 handlers["memory.readbyte"] = function(p)
   if type(p) ~= "table" or type(p.address) ~= "number" then
-    error("memory.readbyte: params.address (number) required")
+    bad_params("memory.readbyte: params.address (number) required")
   end
   return memory.readbyte(p.address)
 end
@@ -128,7 +135,7 @@ end
 handlers["memory.readbyterange"] = function(p)
   if type(p) ~= "table" or type(p.address) ~= "number"
      or type(p.length) ~= "number" then
-    error("memory.readbyterange: params.address and params.length required")
+    bad_params("memory.readbyterange: params.address and params.length required")
   end
   local s = memory.readbyterange(p.address, p.length)
   local out = {}
@@ -139,7 +146,7 @@ end
 handlers["memory.writebyte"] = function(p)
   if type(p) ~= "table" or type(p.address) ~= "number"
      or type(p.value) ~= "number" then
-    error("memory.writebyte: params.address and params.value required")
+    bad_params("memory.writebyte: params.address and params.value required")
   end
   memory.writebyte(p.address, p.value)
   return true
@@ -152,7 +159,7 @@ end
 
 handlers["joypad.set"] = function(p)
   if type(p) ~= "table" or type(p.input) ~= "table" then
-    error("joypad.set: params.input (table) required")
+    bad_params("joypad.set: params.input (table) required")
   end
   local player = p.player or 1
   joypad.set(player, p.input)
@@ -185,6 +192,12 @@ end
 -- Their handlers must be written so they never error in practice.
 local YIELDING_METHODS = { ["emu.step"] = true, ["gui.screenshot"] = true }
 
+-- Strip Lua's "<source>:<line>: " prefix from a runtime error message.
+local function clean_lua_error(s)
+  s = tostring(s)
+  return (s:gsub("^[^:]+:%d+:%s*", ""))
+end
+
 local function dispatch(req)
   if type(req) ~= "table" then
     return { id = json.null, error = { code = "parse_error", message = "request must be an object" } }
@@ -204,7 +217,12 @@ local function dispatch(req)
 
   local ok, result = pcall(handler, req.params)
   if not ok then
-    return { id = id, error = { code = "internal_error", message = tostring(result) } }
+    -- Structured error from bad_params(): { code = ..., message = ... }
+    if type(result) == "table" and type(result.code) == "string" then
+      return { id = id, error = { code = result.code, message = tostring(result.message or "") } }
+    end
+    -- Plain Lua runtime error: strip "file:line: " prefix to keep messages clean.
+    return { id = id, error = { code = "lua_error", message = clean_lua_error(result) } }
   end
   return { id = id, result = result }
 end
