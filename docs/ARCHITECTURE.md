@@ -140,6 +140,8 @@ Server-side, `BridgeError` carries `code` and `message` attributes; `BridgeUnrea
 
 Initial handler set (v1):
 
+**Core / timeline**
+
 | Method | Description |
 | --- | --- |
 | `ping` | Smoke test; returns `"pong"` |
@@ -147,12 +149,49 @@ Initial handler set (v1):
 | `emu.step` (`frames=1`) | Synchronously advance N frames; returns the new framecount |
 | `emu.pause` / `emu.unpause` / `emu.paused` | Bridge-level pause flag (paused by default) |
 | `emu.message` | Show a message in FCEUX's overlay |
+| `emu.poweron` | Hard reset (NES power cycle) |
+| `emu.softreset` | Soft reset |
+| `emu.loadrom` (`filename`) | Switch ROMs mid-session; returns the loaded `{filename, framecount}` |
+
+**Memory**
+
+| Method | Description |
+| --- | --- |
 | `memory.readbyte` | Read one byte from CPU RAM |
 | `memory.readbyterange` | Read N bytes; returned as a numeric array |
+| `memory.readword` | 16-bit read; one-arg = little-endian @ addr / addr+1; two-arg = low @ `address`, high @ `address_high` |
 | `memory.writebyte` | Write one byte |
+| `memory.getregister` | Read a 6502 register: `a`, `x`, `y`, `s`, `p`, `pc` |
+
+**Input**
+
+| Method | Description |
+| --- | --- |
 | `joypad.get` | Read controller state for a player |
 | `joypad.set` | Force controller state for a player |
-| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Advances 1 frame as a side effect (see gotchas). |
+
+**Savestates**
+
+| Method | Description |
+| --- | --- |
+| `savestate.save` (`slot?`) | Save current state. With slot=1-10 → reusable session slot. Without slot → single-use anonymous state |
+| `savestate.load` (`slot?`) | Restore. Slots are reusable; anonymous is consumed on load |
+
+**Visuals**
+
+| Method | Description |
+| --- | --- |
+| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Advances 1 frame as a side effect (see gotchas) |
+| `gui.text` (`x, y, text, color?`) | Draw text on overlay. One-shot per call; FCEUX clears between frames |
+| `gui.box` (`x1, y1, x2, y2, fillcolor?, outlinecolor?`) | Draw a rectangle. One-shot |
+| `gui.pixel` (`x, y, color?`) | Draw one pixel. One-shot |
+
+**ROM**
+
+| Method | Description |
+| --- | --- |
+| `rom.getfilename` | Base filename of the loaded ROM |
+| `rom.gethash` (`type=md5\|base64`) | Hash of the loaded ROM |
 
 The bridge starts **paused** so an LLM agent owns the timeline; frames only tick when the agent calls `emu.step`. Switch to real-time mode with `emu.unpause` (frames tick at NTSC ~60 Hz from the bridge's main loop).
 
@@ -165,6 +204,8 @@ Adding a new method is a one-line entry in the dispatch table — see `bridge.lu
 - **First `emu.frameadvance` after script load is a warm-up.** Under FCEUX 2.6.6, the very first `emu.frameadvance()` a script runs yields control but does not bump `emu.framecount()`. Subsequent calls increment normally. `bridge.lua` calls `emu.frameadvance()` once at startup before entering the main loop so the first agent-driven `emu.step` doesn't see an off-by-one.
 - **Lua 5.1 cannot yield across `pcall`.** `emu.frameadvance` yields under the hood, and Lua 5.1's `pcall` blocks coroutine yielding (`attempt to yield across metamethod/C-call boundary`). The dispatcher therefore runs handlers that call `emu.frameadvance` (currently `emu.step` and `gui.screenshot`) *unprotected*. The `YIELDING_METHODS` set in `bridge.lua` lists them; their handlers must be written so they do not error in normal operation.
 - **`gui.savescreenshotas` is deferred.** Calling it queues the PNG write for the next frame render; if the bridge stays paused, the file is never written. `gui.screenshot` therefore advances exactly one frame after `savescreenshotas` to flush the write, and returns the post-advance framecount alongside the path so the agent knows what frame was captured.
+- **`savestate.persist` crashes the embedded Lua.** The docs say it makes a state survive across loads, but calling it under FCEUX 2.6.6 takes the bridge down. The savestate handlers therefore don't call it — anonymous saves end up single-use (FCEUX deletes the state on load), and slots stay in-memory rather than being written to disk.
+- **`savestate.object(N)` returns a fresh handle each call.** A save through one handle and a load through another (even for the same slot N) operate on different objects — the load sees no state. The handlers cache one savestate object per slot for the script's lifetime so save and load see the same handle, which makes slots 1-10 reusable across many save/load cycles within a session.
 
 ## Limitations / future work
 

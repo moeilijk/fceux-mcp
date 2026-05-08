@@ -225,6 +225,110 @@ def build_server(client: BridgeClient) -> FastMCP:
         result = client.call("gui.screenshot")
         return Image(path=result["path"], format="png")
 
+    # --- Emulator lifecycle -------------------------------------------------
+
+    @mcp.tool()
+    def emu_poweron() -> dict:
+        """Power-cycle the NES (hard reset). Frame counter resets to 0."""
+        return client.call("emu.poweron")
+
+    @mcp.tool()
+    def emu_softreset() -> dict:
+        """Soft-reset the NES (equivalent to the console's reset button)."""
+        return client.call("emu.softreset")
+
+    @mcp.tool()
+    def emu_loadrom(filename: str) -> dict:
+        """Load a different ROM. Path is resolved relative to bridge.lua or
+        as absolute. Note: if the path can't be loaded, FCEUX silently falls
+        back to the most-recent ROM; the returned `filename` is what's
+        actually loaded so the caller can detect that case."""
+        return client.call("emu.loadrom", {"filename": filename})
+
+    # --- Savestates ---------------------------------------------------------
+
+    @mcp.tool()
+    def savestate_save(slot: int | None = None) -> dict:
+        """Save current emulator state. With slot=1-10 saves into a session
+        slot that's reusable across many loads (in-memory; cleared when
+        FCEUX exits). Without slot saves into a single-use anonymous
+        in-memory state — note these are single-use: FCEUX deletes the
+        state on load, so you must save again before each anonymous
+        load. For repeated rewinds to the same point, use a slot."""
+        params = {"slot": slot} if slot is not None else None
+        return client.call("savestate.save", params)
+
+    @mcp.tool()
+    def savestate_load(slot: int | None = None) -> dict:
+        """Restore a previously saved state. With slot=1-10 loads from that
+        session slot (reusable). Without slot loads from the single-use
+        anonymous state. Errors if the slot was never saved or the
+        anonymous state isn't fresh."""
+        params = {"slot": slot} if slot is not None else None
+        return client.call("savestate.load", params)
+
+    # --- Memory: word reads + CPU registers ---------------------------------
+
+    @mcp.tool()
+    def memory_readword(address: int, address_high: int | None = None) -> int:
+        """Read a 16-bit word from CPU RAM. With one address, reads
+        little-endian at address & address+1. With two, reads the low byte
+        from `address` and the high byte from `address_high` (useful for
+        games that store 16-bit values as separated low/high bytes)."""
+        params: dict[str, int] = {"address": address}
+        if address_high is not None:
+            params["address_high"] = address_high
+        return client.call("memory.readword", params)
+
+    @mcp.tool()
+    def memory_getregister(name: str) -> int:
+        """Read a 6502 CPU register: one of a, x, y, s, p, pc."""
+        return client.call("memory.getregister", {"name": name})
+
+    # --- ROM info -----------------------------------------------------------
+
+    @mcp.tool()
+    def rom_getfilename() -> str:
+        """Base filename of the loaded ROM."""
+        return client.call("rom.getfilename")
+
+    @mcp.tool()
+    def rom_gethash(type: str = "md5") -> str:
+        """Hash of the loaded ROM. `type` is 'md5' (hex) or 'base64'."""
+        return client.call("rom.gethash", {"type": type})
+
+    # --- GUI overlay drawing (one-shot per call) ---------------------------
+
+    @mcp.tool()
+    def gui_text(x: int, y: int, text: str, color: str | None = None) -> bool:
+        """Draw text on FCEUX's overlay at (x, y). Drawn for one frame only;
+        call every step to keep it visible. Color may be a name ('red',
+        'orange', 'white'), '#rrggbb', or 'P##' palette code."""
+        params: dict = {"x": x, "y": y, "text": text}
+        if color is not None:
+            params["color"] = color
+        return client.call("gui.text", params)
+
+    @mcp.tool()
+    def gui_box(x1: int, y1: int, x2: int, y2: int,
+                fillcolor: str | None = None,
+                outlinecolor: str | None = None) -> bool:
+        """Draw a rectangle on FCEUX's overlay. One-shot per call."""
+        params: dict = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+        if fillcolor is not None:
+            params["fillcolor"] = fillcolor
+        if outlinecolor is not None:
+            params["outlinecolor"] = outlinecolor
+        return client.call("gui.box", params)
+
+    @mcp.tool()
+    def gui_pixel(x: int, y: int, color: str | None = None) -> bool:
+        """Draw one pixel on FCEUX's overlay. One-shot per call."""
+        params: dict = {"x": x, "y": y}
+        if color is not None:
+            params["color"] = color
+        return client.call("gui.pixel", params)
+
     return mcp
 
 

@@ -184,6 +184,174 @@ handlers["gui.screenshot"] = function(p)
 end
 
 ----------------------------------------------------------------------
+-- Additional handlers (savestate, loadrom, more memory/gui/rom)
+----------------------------------------------------------------------
+
+-- Emulator lifecycle
+handlers["emu.poweron"] = function(_)
+  emu.poweron()
+  return { framecount = emu.framecount() }
+end
+
+handlers["emu.softreset"] = function(_)
+  emu.softreset()
+  return { framecount = emu.framecount() }
+end
+
+handlers["emu.loadrom"] = function(p)
+  if type(p) ~= "table" or type(p.filename) ~= "string" then
+    bad_params("emu.loadrom: params.filename (string) required")
+  end
+  emu.loadrom(p.filename)
+  -- FCEUX silently falls back to the most-recent ROM if the path can't
+  -- be loaded, so report what's actually loaded now.
+  return { filename = rom.getfilename(), framecount = emu.framecount() }
+end
+
+-- Savestates. Slot 1-10 uses FCEUX's persistent slots (saved to disk).
+-- Without a slot, save/load operate on a single shared anonymous state
+-- kept alive in memory via savestate.persist (otherwise FCEUX deletes
+-- anonymous states after the first load).
+local anon_state = nil
+
+local function require_slot(p, fn)
+  if type(p) ~= "table" or type(p.slot) ~= "number" then
+    return nil
+  end
+  local slot = math.floor(p.slot)
+  if slot < 1 or slot > 10 then
+    bad_params(fn .. ": slot must be in 1-10 (got " .. tostring(p.slot) .. ")")
+  end
+  return slot
+end
+
+-- Two FCEUX 2.6.6 quirks shape the savestate handlers below:
+--   1. savestate.persist crashes the embedded Lua, so we can't make a
+--      single state survive across multiple loads via that route.
+--   2. savestate.object(N) returns a fresh handle each call, so a save
+--      via one call to object(N) and a load via another call to object(N)
+--      operate on different objects — the load sees no state.
+-- We therefore cache the savestate object per slot for the script's
+-- lifetime, which makes slots 1-10 reusable across many save/load cycles
+-- (in-memory; not written to disk without persist). Anonymous saves stay
+-- single-use because FCEUX deletes anon state on load.
+local slot_objects = {}
+
+handlers["savestate.save"] = function(p)
+  local slot = require_slot(p, "savestate.save")
+  if slot then
+    local s = slot_objects[slot]
+    if not s then
+      s = savestate.object(slot)
+      slot_objects[slot] = s
+    end
+    savestate.save(s)
+    return { slot = slot, framecount = emu.framecount() }
+  end
+  anon_state = savestate.object()
+  savestate.save(anon_state)
+  return { framecount = emu.framecount() }
+end
+
+handlers["savestate.load"] = function(p)
+  local slot = require_slot(p, "savestate.load")
+  if slot then
+    local s = slot_objects[slot]
+    if not s then
+      bad_params("savestate.load: slot " .. slot .. " has no saved state "
+                 .. "in this session — call savestate.save first")
+    end
+    savestate.load(s)
+    return { slot = slot, framecount = emu.framecount() }
+  end
+  if not anon_state then
+    bad_params("savestate.load: no anonymous savestate available "
+               .. "(anon states are single-use; call savestate.save again, "
+               .. "or use a numbered slot for repeated rewinds)")
+  end
+  savestate.load(anon_state)
+  anon_state = nil
+  return { framecount = emu.framecount() }
+end
+
+-- Memory: word reads + CPU register access
+handlers["memory.readword"] = function(p)
+  if type(p) ~= "table" or type(p.address) ~= "number" then
+    bad_params("memory.readword: params.address (number) required")
+  end
+  if type(p.address_high) == "number" then
+    return memory.readword(p.address, p.address_high)
+  end
+  return memory.readword(p.address)
+end
+
+local VALID_REGISTERS = { a = true, x = true, y = true, s = true, p = true, pc = true }
+
+handlers["memory.getregister"] = function(p)
+  if type(p) ~= "table" or type(p.name) ~= "string" then
+    bad_params("memory.getregister: params.name (string) required")
+  end
+  local name = p.name:lower()
+  if not VALID_REGISTERS[name] then
+    bad_params("memory.getregister: name must be one of a, x, y, s, p, pc")
+  end
+  return memory.getregister(name)
+end
+
+-- ROM info
+handlers["rom.getfilename"] = function(_)
+  return rom.getfilename()
+end
+
+handlers["rom.gethash"] = function(p)
+  local hashtype = "md5"
+  if type(p) == "table" and type(p.type) == "string" then
+    hashtype = p.type
+  end
+  if hashtype ~= "md5" and hashtype ~= "base64" then
+    bad_params("rom.gethash: type must be 'md5' or 'base64'")
+  end
+  return rom.gethash(hashtype)
+end
+
+-- GUI overlay drawing. These are one-shot per call: FCEUX paints them on
+-- the next rendered frame and clears between frames. To make an overlay
+-- persist, the agent has to call them every step.
+handlers["gui.text"] = function(p)
+  if type(p) ~= "table" or type(p.x) ~= "number" or type(p.y) ~= "number"
+     or type(p.text) ~= "string" then
+    bad_params("gui.text: params x (number), y (number), text (string) required")
+  end
+  if p.color ~= nil then
+    gui.text(p.x, p.y, p.text, p.color)
+  else
+    gui.text(p.x, p.y, p.text)
+  end
+  return true
+end
+
+handlers["gui.box"] = function(p)
+  if type(p) ~= "table" or type(p.x1) ~= "number" or type(p.y1) ~= "number"
+     or type(p.x2) ~= "number" or type(p.y2) ~= "number" then
+    bad_params("gui.box: params x1, y1, x2, y2 (numbers) required")
+  end
+  gui.box(p.x1, p.y1, p.x2, p.y2, p.fillcolor, p.outlinecolor)
+  return true
+end
+
+handlers["gui.pixel"] = function(p)
+  if type(p) ~= "table" or type(p.x) ~= "number" or type(p.y) ~= "number" then
+    bad_params("gui.pixel: params x, y (numbers) required")
+  end
+  if p.color ~= nil then
+    gui.pixel(p.x, p.y, p.color)
+  else
+    gui.pixel(p.x, p.y)
+  end
+  return true
+end
+
+----------------------------------------------------------------------
 -- JSON request / response
 ----------------------------------------------------------------------
 
