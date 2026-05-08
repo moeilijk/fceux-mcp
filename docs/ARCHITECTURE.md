@@ -142,6 +142,7 @@ Initial handler set (v1):
 | `memory.writebyte` | Write one byte |
 | `joypad.get` | Read controller state for a player |
 | `joypad.set` | Force controller state for a player |
+| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Advances 1 frame as a side effect (see gotchas). |
 
 The bridge starts **paused** so an LLM agent owns the timeline; frames only tick when the agent calls `emu.step`. Switch to real-time mode with `emu.unpause` (frames tick at NTSC ~60 Hz from the bridge's main loop).
 
@@ -152,7 +153,8 @@ Adding a new method is a one-line entry in the dispatch table — see `bridge.lu
 - **Non-standard `tostring`.** FCEUX 2.6.6's embedded Lua has a `tostring` that stringifies *all* its arguments and concatenates them, like `print` does — `tostring(true, {a=1}) -> "true {a=1}"`. Standard Lua 5.1 ignores extra args. rxi/json originally mapped `boolean` directly to the global `tostring`, so the encoder's internal `stack` table leaked into encoded output. The vendored copy in `vendor/json/json.lua` patches this with a one-arg wrapper; comment in the file marks the change.
 - **`emu.pause()` blocks the frame loop.** Once FCEUX is paused, `emu.frameadvance()` blocks indefinitely waiting for the next frame, so the bridge's `pump()` would never run again — including `emu.unpause`. To avoid that, `bridge.lua` does **not** call FCEUX's `emu.pause()`. Instead, the `emu.pause` / `emu.unpause` / `emu.paused` handlers manipulate a bridge-local `paused` flag that suppresses `emu.frameadvance()` in the main loop. The agent gets the same observable effect (no frames advance) and the bridge stays responsive.
 - **First `emu.frameadvance` after script load is a warm-up.** Under FCEUX 2.6.6, the very first `emu.frameadvance()` a script runs yields control but does not bump `emu.framecount()`. Subsequent calls increment normally. `bridge.lua` calls `emu.frameadvance()` once at startup before entering the main loop so the first agent-driven `emu.step` doesn't see an off-by-one.
-- **Lua 5.1 cannot yield across `pcall`.** `emu.frameadvance` yields under the hood, and Lua 5.1's `pcall` blocks coroutine yielding (`attempt to yield across metamethod/C-call boundary`). The dispatcher therefore runs handlers that call `emu.frameadvance` (currently `emu.step`) *unprotected*. The `YIELDING_METHODS` set in `bridge.lua` lists them; their handlers must be written so they do not error in normal operation.
+- **Lua 5.1 cannot yield across `pcall`.** `emu.frameadvance` yields under the hood, and Lua 5.1's `pcall` blocks coroutine yielding (`attempt to yield across metamethod/C-call boundary`). The dispatcher therefore runs handlers that call `emu.frameadvance` (currently `emu.step` and `gui.screenshot`) *unprotected*. The `YIELDING_METHODS` set in `bridge.lua` lists them; their handlers must be written so they do not error in normal operation.
+- **`gui.savescreenshotas` is deferred.** Calling it queues the PNG write for the next frame render; if the bridge stays paused, the file is never written. `gui.screenshot` therefore advances exactly one frame after `savescreenshotas` to flush the write, and returns the post-advance framecount alongside the path so the agent knows what frame was captured.
 
 ## Limitations / future work
 

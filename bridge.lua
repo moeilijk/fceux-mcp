@@ -149,6 +149,23 @@ handlers["joypad.set"] = function(p)
   return true
 end
 
+-- Writes the emulated screen to a PNG via FCEUX's PNG encoder. Returns the
+-- absolute path and the framecount of the captured frame.
+--
+-- gui.savescreenshotas is deferred: FCEUX queues the write to flush during
+-- the next frame render. We advance one frame to force that flush so the
+-- file exists by the time the response is sent. Side effect: capturing the
+-- screen ticks the emulator by 1 frame.
+handlers["gui.screenshot"] = function(p)
+  local path = "/tmp/fceux-mcp-cap.png"
+  if type(p) == "table" and type(p.path) == "string" and #p.path > 0 then
+    path = p.path
+  end
+  gui.savescreenshotas(path)
+  emu.frameadvance()
+  return { path = path, framecount = emu.framecount() }
+end
+
 ----------------------------------------------------------------------
 -- JSON request / response
 ----------------------------------------------------------------------
@@ -156,7 +173,7 @@ end
 -- Methods whose handlers internally call emu.frameadvance (which yields).
 -- Lua 5.1 cannot yield across a pcall boundary, so these run unprotected.
 -- Their handlers must be written so they never error in practice.
-local YIELDING_METHODS = { ["emu.step"] = true }
+local YIELDING_METHODS = { ["emu.step"] = true, ["gui.screenshot"] = true }
 
 local function dispatch(req)
   if type(req) ~= "table" then

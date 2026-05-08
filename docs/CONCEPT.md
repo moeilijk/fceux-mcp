@@ -57,6 +57,12 @@ Tools:
 
 Alternative considered and rejected: an `advance_until(condition)` tool that resolves when a memory address matches a value. Expressive but defers logic to the bridge that's better expressed as a step-and-poll loop on the agent side; revisit if a real workload needs it.
 
+### Screen capture format — decided: PNG via temp file path
+
+The bridge calls `gui.savescreenshotas("/tmp/fceux-mcp-cap.png")` (path optionally overridable per request) and returns the path. The MCP server reads the file and forwards the bytes as an MCP image content block to the client. FCEUX's PNG encoder handles compression, so the payload is small (typical NES frame compresses to under 10 KB) and the bridge handler stays trivial.
+
+Alternatives considered: inline raw RGBA via `gui.gdscreenshot` (no disk I/O but ~330 KB base64 payload per frame and adds a Pillow dependency); inline PNG bytes read back by the bridge (small payload, but bridge has to do file I/O and base64 in Lua, more moving parts). The temp-file approach keeps the bridge simple and lets the MCP server own all binary handling.
+
 ## Tool surface (initial scope)
 
 Wrap the most useful Lua libraries first; defer the rest until there's a real need.
@@ -88,6 +94,5 @@ v1 should target the long-lived session — it's what makes "play this game" fea
 
 ## Open questions
 
-- **Screen capture format.** Return raw RGB bytes, base64 PNG, or a path to a saved file? PNG is friendlier to LLM clients but costs a conversion step.
 - **Lifecycle.** Who launches FCEUX — the MCP server (spawn as subprocess) or the user (server attaches to a running instance)?
 - **Error model.** Lua errors inside FCEUX need to surface as structured MCP tool errors, not silent failures.
