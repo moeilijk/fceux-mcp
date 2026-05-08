@@ -66,7 +66,10 @@ end
 -- main loop. We don't call FCEUX's emu.pause() because that would also block
 -- frameadvance, which is how we get a tick to drive pump() — the bridge would
 -- stop responding. Same observable effect for the agent (no frames advance).
-local paused = false
+--
+-- Default to paused so an LLM agent owns the timeline: frames only tick on
+-- emu.step. Call emu.unpause to switch into continuous (real-time) mode.
+local paused = true
 
 handlers["emu.pause"] = function(_)
   paused = true
@@ -80,6 +83,21 @@ end
 
 handlers["emu.paused"] = function(_)
   return paused
+end
+
+-- Synchronous step: advance N frames inside the handler, then return.
+-- Calling emu.frameadvance() from a handler is fine — it just yields to FCEUX
+-- for one frame and returns; the response goes out afterwards, so a follow-up
+-- memory.readbyte sees post-step state.
+handlers["emu.step"] = function(p)
+  local n = 1
+  if type(p) == "table" and type(p.frames) == "number" then
+    n = math.max(1, math.floor(p.frames))
+  end
+  for _ = 1, n do
+    emu.frameadvance()
+  end
+  return emu.framecount()
 end
 
 handlers["emu.message"] = function(p)
@@ -135,6 +153,11 @@ end
 -- JSON request / response
 ----------------------------------------------------------------------
 
+-- Methods whose handlers internally call emu.frameadvance (which yields).
+-- Lua 5.1 cannot yield across a pcall boundary, so these run unprotected.
+-- Their handlers must be written so they never error in practice.
+local YIELDING_METHODS = { ["emu.step"] = true }
+
 local function dispatch(req)
   if type(req) ~= "table" then
     return { id = json.null, error = { code = "parse_error", message = "request must be an object" } }
@@ -146,6 +169,10 @@ local function dispatch(req)
 
   if not handler then
     return { id = id, error = { code = "method_not_found", message = "no handler for '" .. tostring(method) .. "'" } }
+  end
+
+  if YIELDING_METHODS[method] then
+    return { id = id, result = handler(req.params) }
   end
 
   local ok, result = pcall(handler, req.params)
@@ -231,6 +258,11 @@ end
 ----------------------------------------------------------------------
 -- Main loop
 ----------------------------------------------------------------------
+
+-- Prime: the first emu.frameadvance after a script loads acts as a yield-only
+-- warm-up under FCEUX 2.6.6 (it does not bump emu.framecount), so do it once
+-- here before any agent-driven step would otherwise see an off-by-one.
+emu.frameadvance()
 
 while true do
   pump()

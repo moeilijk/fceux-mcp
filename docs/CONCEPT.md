@@ -40,6 +40,23 @@ Wire format: length-prefixed JSON messages — 4-byte big-endian length followed
 
 Alternatives considered and rejected: stdio piping (FCEUX is GUI-only, no inherited stdio for Lua), named pipes (OS-specific, awkward on Windows), file polling (no install but adds at least one frame of latency per call). File polling stays viable as a documented fallback for builds where LuaSocket cannot be loaded.
 
+### Server language — decided: Python
+
+The MCP server is glue: receive an MCP tool call, forward a JSON line over TCP to `bridge.lua`, return the response. Python with the official [`mcp`](https://pypi.org/project/mcp/) SDK keeps that to a small file with no build step, and Python is already required for the bridge smoke tests so contributors don't pick up a new language just to run things.
+
+Alternatives considered: TypeScript with `@modelcontextprotocol/sdk` has more public MCP server examples, but that gap doesn't matter for a project this small; Rust would be over-engineered for thin TCP plumbing. Both remain viable rewrites if the server ever grows beyond glue.
+
+### Frame-stepping semantics — decided: paused by default + `emu.step(n)`
+
+LLMs can't reason at 60 Hz, so a continuously-ticking emulator forces the agent into races between "set joypad" and "frame consumes input," and means every memory read is slightly stale. The bridge therefore starts paused and only advances frames when the agent asks.
+
+Tools:
+
+- `emu.step(frames=1)` — advances exactly N frames, then returns the new framecount. Synchronous: the response is only sent after the frames are emulated, so a follow-up `memory.readbyte` reads the post-step state.
+- `emu.pause` / `emu.unpause` / `emu.paused` — bridge-level flag. `unpause` switches into real-time mode (frames tick at NTSC ~60 Hz) for cases like recording a demo or watching a run. `pause` returns to step-only.
+
+Alternative considered and rejected: an `advance_until(condition)` tool that resolves when a memory address matches a value. Expressive but defers logic to the bridge that's better expressed as a step-and-poll loop on the agent side; revisit if a real workload needs it.
+
 ## Tool surface (initial scope)
 
 Wrap the most useful Lua libraries first; defer the rest until there's a real need.
@@ -71,8 +88,6 @@ v1 should target the long-lived session — it's what makes "play this game" fea
 
 ## Open questions
 
-- **Server language.** TypeScript (matches most MCP examples), Python (easier to ship a Lua bridge alongside), or Rust (one static binary)?
-- **Frame-stepping semantics.** Does `frameadvance` block until the frame completes, or fire-and-forget with a separate "wait for frame N" tool? Affects how agents reason about timing.
 - **Screen capture format.** Return raw RGB bytes, base64 PNG, or a path to a saved file? PNG is friendlier to LLM clients but costs a conversion step.
 - **Lifecycle.** Who launches FCEUX — the MCP server (spawn as subprocess) or the user (server attaches to a running instance)?
 - **Error model.** Lua errors inside FCEUX need to surface as structured MCP tool errors, not silent failures.
