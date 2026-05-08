@@ -63,6 +63,17 @@ The bridge calls `gui.savescreenshotas` with a default path under the platform t
 
 Alternatives considered: inline raw RGBA via `gui.gdscreenshot` (no disk I/O but ~330 KB base64 payload per frame and adds a Pillow dependency); inline PNG bytes read back by the bridge (small payload, but bridge has to do file I/O and base64 in Lua, more moving parts). The temp-file approach keeps the bridge simple and lets the MCP server own all binary handling.
 
+### Lifecycle — decided: server-launched, with attach-if-running fallback
+
+Because the agent owns the timeline (paused-by-default + `emu.step`), the user has very little to do with the emulator's day-to-day operation — they're an observer of the FCEUX window, not a co-driver. So the MCP server owns FCEUX's process lifecycle:
+
+- On startup, the server probes the bridge port. If something is already listening (dev/debug case), it just attaches.
+- Otherwise the server spawns `fceux --loadlua bridge.lua <rom>` as a subprocess, polls the port until the bridge is listening (with a timeout), and then announces tools as available.
+- ROM path comes from server config (Claude Desktop JSON / CLI flag / env var). Mid-session ROM switching is supported later via an `emu.loadrom` tool that wraps FCEUX's `emu.loadrom`.
+- On server shutdown the spawned FCEUX is terminated. If FCEUX crashes, the server respawns on the next tool call.
+
+Alternative considered: user-launched (server only attaches). Cleaner separation of GUI lifecycle but two-step setup, and forces the user to manage a process they otherwise don't interact with much. Kept as a fallback (server attaches if a bridge is already up).
+
 ## Tool surface (initial scope)
 
 Wrap the most useful Lua libraries first; defer the rest until there's a real need.
@@ -94,5 +105,4 @@ v1 should target the long-lived session — it's what makes "play this game" fea
 
 ## Open questions
 
-- **Lifecycle.** Who launches FCEUX — the MCP server (spawn as subprocess) or the user (server attaches to a running instance)?
 - **Error model.** Lua errors inside FCEUX need to surface as structured MCP tool errors, not silent failures.
