@@ -24,7 +24,6 @@ fceux.exe -lua C:\full\path\to\bridge.lua <rom>          # Windows build
 
 The Windows build has no `--loadlua`; its option is `-lua <script>` (src/drivers/win/args.cpp), and every option takes a value. The script path should be absolute: FCEUX changes into the script's folder when it loads it.
 
-
 FCEUX boots, loads the ROM, and hands `bridge.lua` to its statically-linked Lua 5.1 interpreter. From that point on, `bridge.lua` runs inside FCEUX's Lua VM with full access to `emu.*`, `memory.*`, `joypad.*`, `gui.*`, etc.
 
 ## Loading LuaSocket from `vendor/`
@@ -85,22 +84,28 @@ LuaSocket reference: <https://lunarmodules.github.io/luasocket/reference.html>.
 
 ## Frame loop and TCP server
 
-`bridge.lua` follows the standard FCEUX scripting idiom:
+Between requests FCEUX itself is paused (`emu.pause()`), and requests are read from a `gui.register` callback:
 
 ```lua
-while true do
-  pump_socket()      -- accept new clients, drain pending requests, send replies
-  emu.frameadvance() -- yield to FCEUX for one frame
+gui.register(poll)   -- FCEUX calls it on every pass of its main loop, paused or not
+emu.pause()
+while true do        -- the main coroutine: runs only while FCEUX is unpaused
+  if job queued then run(job) else emu.frameadvance() end
 end
 ```
 
-`emu.frameadvance` blocks until FCEUX has rendered the next frame (~16.6 ms at NTSC 60 Hz), giving the bridge a natural tick. `pump_socket()` is non-blocking — it polls the listening socket for new clients and drains whatever bytes are already in each client's receive buffer.
+Why it works (FCEUX 2.6.6 source):
+
+- While paused, FCEUX's main loop keeps calling `FCEUI_Emulate`, which draws the last frame through `FCEU_PutImage` → `FCEU_LuaGui` (fceu.cpp, video.cpp), and that runs the `gui.register` callback. On Windows the loop then pumps window messages and sleeps 50 ms (drivers/win/main.cpp); on Qt the emulator thread does the same through `fceuWrapperUpdate` → `DoFun`. So the window, sound and close keep working, and `poll()` runs about 20 times a second.
+- A paused FCEUX does not resume the script's main coroutine: `FCEUI_Emulate` returns before `FCEU_LuaFrameBoundary`. A request that runs frames (a *job*: `emu.step`, `emu.loadrom`) therefore unpauses FCEUX, and the main coroutine runs it at the start of the next frame, before that frame's input is read, so a `joypad.set` there applies to that frame.
+- A job calls `finish()` right before its last `emu.frameadvance`: that pauses FCEUX again (unless the agent chose real-time mode) and marks the job done. The frame is still emulated, and `poll()` sends the reply on its next pass. A job of N frames runs exactly N frames.
+- `poll()` is non-blocking (the sockets have timeout 0) and never yields; it handles one job at a time, and while a job runs the next request waits in the buffer.
 
 Trade-offs of this design:
 
-- **Latency.** A request arriving just after `emu.frameadvance` returns will be processed immediately; one arriving just before will wait up to one frame. Worst case: ~16 ms.
-- **Throughput.** Many requests can be processed per frame (the pump drains everything available), so batching is cheap.
-- **Backpressure.** If the agent sends faster than one frame can drain, requests queue in the OS socket buffer. That's fine for typical tool-call rates.
+- **Latency.** While paused, a request waits up to one pass of FCEUX's loop, about 50 ms on Windows.
+- **Throughput.** Requests that don't run frames are handled in the same pass, as many as are buffered.
+- **Sound.** FCEUX makes sound only for emulated frames, so there is a gap between two jobs. Measured on Windows (OBS recording, gaps of 20 ms or more at -50 dB): steps of 600 frames give one gap of about 30 ms per step, steps of 60 frames one of 20–34 ms per step, and steps of 1 frame give 33–43 ms of silence every ~51 ms. Batch input into long steps when sound matters.
 
 ## Wire protocol
 
@@ -152,8 +157,10 @@ Initial handler set (v1):
 | --- | --- |
 | `ping` | Smoke test; returns `"pong"` |
 | `emu.framecount` | Current frame number |
-| `emu.step` (`frames=1`) | Synchronously advance N frames; returns the new framecount |
-| `emu.pause` / `emu.unpause` / `emu.paused` | Bridge-level pause flag (paused by default) |
+| `emu.step` (`frames=1`) | Synchronously advance N frames with whatever input is set; returns the new framecount |
+| `emu.step` (`steps=[{buttons, frames, reset}]`) | Play each step's buttons for its frames: all eight buttons (`A`, `B`, `select`, `start`, `up`, `down`, `left`, `right`) are set on every frame, true when listed; `reset` gives a soft reset before the step's first frame, as an FM2 reset command. Returns the new framecount |
+| `emu.pause` / `emu.unpause` / `emu.paused` | FCEUX's own pause. Paused by default: FCEUX pauses again after every job. `unpause` switches into real-time mode |
+| `emu.exit` | Close FCEUX the way the user would (`emu.exit`, after the reply has gone out) |
 | `emu.message` | Show a message in FCEUX's overlay |
 | `emu.poweron` | Hard reset (NES power cycle) |
 | `emu.softreset` | Soft reset |
@@ -187,7 +194,7 @@ Initial handler set (v1):
 
 | Method | Description |
 | --- | --- |
-| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Advances 1 frame as a side effect (see gotchas) |
+| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Runs no frames (see gotchas) |
 | `gui.text` (`x, y, text, color?`) | Draw text on overlay. One-shot per call; FCEUX clears between frames |
 | `gui.box` (`x1, y1, x2, y2, fillcolor?, outlinecolor?`) | Draw a rectangle. One-shot |
 | `gui.pixel` (`x, y, color?`) | Draw one pixel. One-shot |
@@ -205,20 +212,22 @@ Initial handler set (v1):
 | --- | --- |
 | `lua.exec` (`code`) | Run an arbitrary Lua chunk inside FCEUX. The full FCEUX Lua API is in scope; `return EXPR` sends a value back. Use for batched reads, ad-hoc queries, and APIs not yet wrapped as typed handlers. `emu.frameadvance` is shadowed (would corrupt FCEUX state inside our pcall — see gotchas) — use `emu.step` for frames |
 
-The bridge starts **paused** so an LLM agent owns the timeline; frames only tick when the agent calls `emu.step`. Switch to real-time mode with `emu.unpause` (frames tick at NTSC ~60 Hz from the bridge's main loop).
+The bridge starts **paused** so an LLM agent owns the timeline; frames only tick when the agent calls `emu.step`. Switch to real-time mode with `emu.unpause` (FCEUX runs at NTSC ~60 Hz).
+
+Methods can be switched off for a session with the environment variable `FCEUX_BRIDGE_DISABLE`, a comma-separated list of method names (e.g. `lua.exec,memory.writebyte`), for a host that hands the bridge to an agent that must not change the game. A disabled method answers `method_not_found`.
 
 Adding a new method is a one-line entry in the dispatch table — see `bridge.lua`.
 
 ## FCEUX-specific quirks (gotchas we hit during bring-up)
 
 - **Non-standard `tostring`.** FCEUX 2.6.6's embedded Lua has a `tostring` that stringifies *all* its arguments and concatenates them, like `print` does — `tostring(true, {a=1}) -> "true {a=1}"`. Standard Lua 5.1 ignores extra args. rxi/json originally mapped `boolean` directly to the global `tostring`, so the encoder's internal `stack` table leaked into encoded output. The vendored copy in `vendor/json/json.lua` patches this with a one-arg wrapper; comment in the file marks the change.
-- **`emu.pause()` blocks the frame loop.** Once FCEUX is paused, `emu.frameadvance()` blocks indefinitely waiting for the next frame, so the bridge's `pump()` would never run again — including `emu.unpause`. To avoid that, `bridge.lua` does **not** call FCEUX's `emu.pause()`. Instead, the `emu.pause` / `emu.unpause` / `emu.paused` handlers manipulate a bridge-local `paused` flag that suppresses `emu.frameadvance()` in the main loop. The agent gets the same observable effect (no frames advance) and the bridge stays responsive.
-- **First `emu.frameadvance` after script load is a warm-up.** Under FCEUX 2.6.6, the very first `emu.frameadvance()` a script runs yields control but does not bump `emu.framecount()`. Subsequent calls increment normally. `bridge.lua` calls `emu.frameadvance()` once at startup before entering the main loop so the first agent-driven `emu.step` doesn't see an off-by-one.
-- **Lua 5.1 cannot yield across `pcall`.** `emu.frameadvance` yields under the hood, and Lua 5.1's `pcall` blocks coroutine yielding (`attempt to yield across metamethod/C-call boundary`). The dispatcher therefore runs handlers that call `emu.frameadvance` (currently `emu.step` and `gui.screenshot`) *unprotected*. The `YIELDING_METHODS` set in `bridge.lua` lists them; their handlers must be written so they do not error in normal operation.
-- **`gui.savescreenshotas` is deferred.** Calling it queues the PNG write for the next frame render; if the bridge stays paused, the file is never written. `gui.screenshot` therefore advances exactly one frame after `savescreenshotas` to flush the write, and returns the post-advance framecount alongside the path so the agent knows what frame was captured.
+- **`emu.pause()` stops the main coroutine.** Once FCEUX is paused, a script waiting in `emu.frameadvance()` is not resumed until something unpauses FCEUX. A script that instead loops without yielding (socket poll + sleep) keeps FCEUX from pumping window messages: the window stops redrawing, Windows marks it "Not Responding" after 5 s, and closing it waits for the script. The bridge therefore polls from a `gui.register` callback, which FCEUX runs while paused (see "Frame loop and TCP server").
+- **First `emu.frameadvance` after script load is a warm-up.** Under FCEUX 2.6.6, the very first `emu.frameadvance()` a script runs yields control but does not bump `emu.framecount()`. The main loop parks in it while FCEUX is paused, so the first job starts counting from frame 0 (measured: `emu.step` of 300 frames from power-on returns 300).
+- **Lua 5.1 cannot yield across `pcall`.** `emu.frameadvance` yields under the hood, and Lua 5.1's `pcall` blocks coroutine yielding (`attempt to yield across metamethod/C-call boundary`). The frames of a job therefore run in the main coroutine, *unprotected*: a job's `check` (protected, in the callback) validates the params first, so its `run` does not error in normal operation.
+- **`gui.savescreenshotas` is deferred.** Calling it queues the PNG write for the start of the next `FCEU_PutImage` (video.cpp), which also runs while paused. `gui.screenshot` therefore runs no frames: it asks for the file in one pass of the callback and replies on the next, after the file is written.
 - **`savestate.persist` crashes the embedded Lua.** The docs say it makes a state survive across loads, but calling it under FCEUX 2.6.6 takes the bridge down. The savestate handlers therefore don't call it — anonymous saves end up single-use (FCEUX deletes the state on load), and slots stay in-memory rather than being written to disk.
 - **`savestate.object(N)` returns a fresh handle each call.** A save through one handle and a load through another (even for the same slot N) operate on different objects — the load sees no state. The handlers cache one savestate object per slot for the script's lifetime so save and load see the same handle, which makes slots 1-10 reusable across many save/load cycles within a session.
-- **An *attempted* yield across pcall corrupts FCEUX's frame loop.** Calling `emu.frameadvance` from inside a pcall'd handler not only fails with `attempt to yield across metamethod/C-call boundary` (expected for Lua 5.1), but also leaves FCEUX in a state where subsequent `emu.frameadvance` calls hang indefinitely. The dispatcher therefore runs handlers that legitimately need to yield (`emu.step`, `emu.loadrom`, `gui.screenshot`) outside pcall via `YIELDING_METHODS`. For `lua.exec`, which runs *inside* pcall and lets the agent write arbitrary code, we shadow `emu.frameadvance` in a sandboxed environment so it errors *before* any yield is attempted — keeping FCEUX healthy.
+- **An *attempted* yield across pcall corrupts FCEUX's frame loop.** Calling `emu.frameadvance` from inside a pcall'd handler not only fails with `attempt to yield across metamethod/C-call boundary` (expected for Lua 5.1), but also leaves FCEUX in a state where subsequent `emu.frameadvance` calls hang indefinitely. The frames of `emu.step` and `emu.loadrom` therefore run in the main coroutine, outside any pcall. For `lua.exec`, which runs *inside* pcall and lets the agent write arbitrary code, we shadow `emu.frameadvance` in a sandboxed environment so it errors *before* any yield is attempted — keeping FCEUX healthy.
 - **`emu.loadrom` is deferred AND can't recover from a no-ROM state.** Two related quirks: (1) calling `emu.loadrom` queues the swap for the next frame render, so a follow-up `rom.getfilename` would still see the old ROM unless we advance a frame first — the handler does that internally, same pattern as `gui.savescreenshotas`. (2) `emu.loadrom` invoked when **no** ROM was loaded at startup crashes the FCEUX process entirely; spawning FCEUX bare with `--loadlua` works, but the agent can never recover because any loadrom kills the emulator. The Python server therefore always launches FCEUX with *something* loaded — either the user-supplied `--rom` or a bundled minimal NES ROM (`fceux_mcp/data/dummy.nes`); the agent's first `emu_loadrom` then transitions cleanly between two loaded ROMs.
 
 The Python server side has its own response-encode hardening: the bridge now wraps `json.encode(resp)` in pcall and falls back to a `lua_error` response if a handler ever returns something non-JSON-serializable (e.g. a userdata leaked from a `lua.exec` chunk). Without this, the encode would throw out of the main loop and crash the bridge.

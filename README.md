@@ -47,6 +47,10 @@ Flags:
 - `--bridge-lua PATH` — override `bridge.lua` location (defaults to the one next to the package).
 - `--fceux PATH` — the FCEUX executable (default `fceux` on the `PATH`).
 
+Environment for the bridge:
+
+- `FCEUX_BRIDGE_DISABLE` — comma-separated method names the bridge refuses for this session, e.g. `lua.exec,memory.writebyte`.
+
 ## Claude Code configuration
 
 Two ways to register the server with Claude Code.
@@ -80,4 +84,4 @@ After either, restart `claude` (or run `/mcp` inside a session) and the 26 fceux
 ## Notes
 
 - Verified on macOS 15 / Apple Silicon with FCEUX 2.6.6 from Homebrew and Python 3.13.
-- Verified on Windows 11 with FCEUX 2.6.6 (win32): the bridge and the MCP tools (server on Python 3.12 under WSL, attached to the bridge). Not yet verified: the server spawning FCEUX from a Windows Python.
+- Verified on Windows 11 with FCEUX 2.6.6 (win32): the bridge, `emu.step` with `steps`, `gui.screenshot`, `emu.exit`, and the MCP tools (server on Python 3.12 under WSL, attached to the bridge). Not yet verified: the server spawning FCEUX from a Windows Python, and the new pausing on the macOS/Linux (Qt) build.
