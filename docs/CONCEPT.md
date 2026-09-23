@@ -53,7 +53,14 @@ LLMs can't reason at 60 Hz, so a continuously-ticking emulator forces the agent 
 Tools:
 
 - `emu.step(frames=1)` — advances exactly N frames, then returns the new framecount. Synchronous: the response is only sent after the frames are emulated, so a follow-up `memory.readbyte` reads the post-step state.
-- `emu.pause` / `emu.unpause` / `emu.paused` — bridge-level flag. `unpause` switches into real-time mode (frames tick at NTSC ~60 Hz) for cases like recording a demo or watching a run. `pause` returns to step-only.
+- `emu.step(steps=[{buttons, frames, reset}])` — the same, holding each step's buttons for its frames. `joypad.set` applies to the next frame only, so holding a button through a multi-frame `emu.step(frames=N)` is not possible; with `steps` the bridge sets all eight buttons on every frame. Measured on Windows: a published FM2 movie (TASVideos #3728, 67,117 frames) played through `steps` of up to 600 frames matches FCEUX's own playback of it on every checked frame.
+- `emu.pause` / `emu.unpause` / `emu.paused` — FCEUX's own pause. `unpause` switches into real-time mode (NTSC ~60 Hz) for cases like recording a demo or watching a run. `pause` returns to step-only.
+
+### Pausing — decided: FCEUX's own pause, requests read from `gui.register`
+
+Between requests FCEUX itself is paused, and the bridge reads its socket from a `gui.register` callback, which FCEUX runs on every pass of its main loop, paused or not. A request that runs frames unpauses FCEUX for exactly those frames. See ARCHITECTURE.md, "Frame loop and TCP server".
+
+Rejected: the earlier design, a bridge-local pause flag with a main loop that polls the socket and sleeps without yielding. It never hands control back to FCEUX while paused, so FCEUX pumps no window messages: on Windows the window stops redrawing, is marked "Not Responding" after 5 s, and cannot be closed until the script yields.
 
 Alternative considered and rejected: an `advance_until(condition)` tool that resolves when a memory address matches a value. Expressive but defers logic to the bridge that's better expressed as a step-and-poll loop on the agent side; revisit if a real workload needs it.
 
@@ -70,7 +77,7 @@ Because the agent owns the timeline (paused-by-default + `emu.step`), the user h
 - On startup, the server probes the bridge port. If something is already listening (dev/debug case), it just attaches.
 - Otherwise the server spawns `fceux --loadlua bridge.lua <rom>` (on Windows `fceux.exe -lua <absolute path to bridge.lua> <rom>`; `--fceux` names the executable) as a subprocess, polls the port until the bridge is listening (with a timeout), and then announces tools as available.
 - ROM path comes from server config (Claude Desktop JSON / CLI flag / env var). Mid-session ROM switching is supported later via an `emu.loadrom` tool that wraps FCEUX's `emu.loadrom`.
-- On server shutdown the spawned FCEUX is terminated. If FCEUX crashes, the server respawns on the next tool call.
+- On server shutdown the server asks the spawned FCEUX to close itself (`emu.exit`), and terminates it only if it is still running 5 s later. If FCEUX crashes, the server respawns on the next tool call.
 
 Alternative considered: user-launched (server only attaches). Cleaner separation of GUI lifecycle but two-step setup, and forces the user to manage a process they otherwise don't interact with much. Kept as a fallback (server attaches if a bridge is already up).
 

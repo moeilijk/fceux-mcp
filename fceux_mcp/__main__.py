@@ -180,23 +180,37 @@ def build_server(client: BridgeClient) -> FastMCP:
         return client.call("emu.framecount")
 
     @mcp.tool()
-    def emu_step(frames: int = 1) -> int:
-        """Advance the emulator by N frames synchronously. Returns the new framecount."""
+    def emu_step(frames: int = 1, steps: list[dict] | None = None) -> int:
+        """Advance the emulator synchronously. Returns the new framecount.
+
+        With only `frames`: advance N frames with whatever input is set
+        (joypad_set applies to the next frame only).
+
+        With `steps`: a list of {"buttons": {"A": true, "right": true, ...},
+        "frames": n, "reset": false}. Each step holds its buttons for its
+        frames: all eight buttons (A, B, select, start, up, down, left, right)
+        are set on every frame, true when listed and false otherwise. `reset`
+        gives a soft reset before the step's first frame. Example:
+            emu_step(steps=[{"buttons": {"right": true, "B": true}, "frames": 60},
+                            {"frames": 10}])
+        """
+        if steps is not None:
+            return client.call("emu.step", {"steps": steps})
         return client.call("emu.step", {"frames": frames})
 
     @mcp.tool()
     def emu_pause() -> bool:
-        """Set the bridge-level pause flag — frames stop advancing until emu_unpause."""
+        """Pause FCEUX — frames stop advancing until emu_unpause (or advance by emu_step)."""
         return client.call("emu.pause")
 
     @mcp.tool()
     def emu_unpause() -> bool:
-        """Clear the bridge-level pause flag — frames advance at NTSC ~60 Hz."""
+        """Unpause FCEUX — frames advance in real time (NTSC ~60 Hz)."""
         return client.call("emu.unpause")
 
     @mcp.tool()
     def emu_paused() -> bool:
-        """Return the current bridge-level pause state."""
+        """True when FCEUX pauses between requests (the default), false in real-time mode."""
         return client.call("emu.paused")
 
     @mcp.tool()
@@ -232,8 +246,8 @@ def build_server(client: BridgeClient) -> FastMCP:
 
     @mcp.tool()
     def gui_screenshot() -> Image:
-        """Capture the current emulated screen as PNG. Note: advances the timeline
-        by one frame (FCEUX defers screenshot writes until the next frame render)."""
+        """Capture the current emulated screen as PNG. Runs no frames: FCEUX writes
+        the file on its next screen update, which also happens while paused."""
         result = client.call("gui.screenshot")
         return Image(path=result["path"], format="png")
 
@@ -416,8 +430,16 @@ def main() -> int:
     try:
         mcp.run()
     finally:
-        client.close()
         if fceux_proc is not None:
+            # Ask FCEUX to close itself (emu.exit), so it shuts down the way a
+            # user closing it would; terminate only if it does not.
+            try:
+                client.call("emu.exit")
+                fceux_proc.wait(timeout=5.0)
+            except (BridgeError, OSError, subprocess.TimeoutExpired):
+                pass
+        client.close()
+        if fceux_proc is not None and fceux_proc.poll() is None:
             fceux_proc.terminate()
             try:
                 fceux_proc.wait(timeout=2.0)

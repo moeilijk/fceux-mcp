@@ -101,43 +101,99 @@ handlers["emu.framecount"] = function(_)
   return emu.framecount()
 end
 
--- Bridge-level pause: setting this flag suppresses emu.frameadvance() in the
--- main loop. We don't call FCEUX's emu.pause() because that would also block
--- frameadvance, which is how we get a tick to drive pump() — the bridge would
--- stop responding. Same observable effect for the agent (no frames advance).
+-- Pausing. Between requests FCEUX itself is paused (emu.pause), so its window,
+-- sound and close keep working, and requests are read from a gui.register
+-- callback: FCEUX calls it on every pass of its main loop, paused or not
+-- (fceu.cpp FCEUI_Emulate -> FCEU_PutImage -> FCEU_LuaGui, v2.6.6). While
+-- paused, FCEUX does not resume the script's main coroutine; a request that
+-- runs frames (a "job", see JOBS below) unpauses FCEUX and the main coroutine
+-- runs it at the start of the next frame.
 --
--- Default to paused so an LLM agent owns the timeline: frames only tick on
--- emu.step. Call emu.unpause to switch into continuous (real-time) mode.
-local paused = true
+-- `hold` is what the agent asked for: true (the default) means FCEUX pauses
+-- again after every job, so frames only tick on emu.step; emu.unpause
+-- switches into continuous (real-time) mode.
+local hold = true
 
 handlers["emu.pause"] = function(_)
-  paused = true
+  hold = true
+  emu.pause()
   return true
 end
 
 handlers["emu.unpause"] = function(_)
-  paused = false
+  hold = false
+  emu.unpause()
   return true
 end
 
 handlers["emu.paused"] = function(_)
-  return paused
+  return hold
 end
 
--- Synchronous step: advance N frames inside the handler, then return.
--- Calling emu.frameadvance() from a handler is fine — it just yields to FCEUX
--- for one frame and returns; the response goes out afterwards, so a follow-up
--- memory.readbyte sees post-step state.
-handlers["emu.step"] = function(p)
-  local n = 1
-  if type(p) == "table" and type(p.frames) == "number" then
-    n = math.max(1, math.floor(p.frames))
-  end
-  for _ = 1, n do
-    emu.frameadvance()
-  end
-  return emu.framecount()
+----------------------------------------------------------------------
+-- Jobs: requests that run frames. Each has a `check` (in the callback,
+-- protected; errors become invalid_params), a `run` (in the main coroutine,
+-- unprotected because it yields; it must not error) and a `result` (in the
+-- callback after the job's last frame). `run` calls finish() right before its
+-- last emu.frameadvance: that pauses FCEUX again when `hold` is set, so a job
+-- of N frames runs exactly N frames.
+----------------------------------------------------------------------
+
+local JOBS = {}
+local job = nil -- { id, method, params, state = "queued" | "running" | "done" }
+
+local function finish()
+  if hold then emu.pause() end
+  job.state = "done"
 end
+
+local BUTTONS = { "A", "B", "select", "start", "up", "down", "left", "right" }
+
+-- emu.step: { frames = n } advances n frames with whatever input is set
+-- (joypad.set applies to the next frame only). { steps = [{ buttons, frames,
+-- reset }] } plays each step's buttons for its frames: all eight buttons are
+-- set on every frame (true when listed, false otherwise), and `reset` gives a
+-- soft reset before the step's first frame, as an FM2 movie's reset command.
+local function step_plan(p)
+  if type(p) == "table" and type(p.steps) == "table" then
+    local plan, total = {}, 0
+    for i, s in ipairs(p.steps) do
+      if type(s) ~= "table" then bad_params("emu.step: steps[" .. i .. "] must be an object") end
+      local n = s.frames == nil and 1 or s.frames
+      if type(n) ~= "number" or n < 0 then bad_params("emu.step: steps[" .. i .. "].frames must be a number >= 0") end
+      local input = {}
+      if s.buttons ~= nil and type(s.buttons) ~= "table" then bad_params("emu.step: steps[" .. i .. "].buttons must be an object") end
+      for _, b in ipairs(BUTTONS) do input[b] = (s.buttons ~= nil and s.buttons[b] == true) end
+      plan[#plan + 1] = { input = input, frames = math.floor(n), reset = s.reset == true }
+      total = total + math.floor(n)
+    end
+    return plan, total
+  end
+  local n = 1
+  if type(p) == "table" and type(p.frames) == "number" then n = math.max(1, math.floor(p.frames)) end
+  return { { frames = n } }, n
+end
+
+JOBS["emu.step"] = {
+  check = function(p)
+    local _, total = step_plan(p)
+    if total < 1 then bad_params("emu.step: no frames to run") end
+  end,
+  run = function(p)
+    local plan, total = step_plan(p)
+    local done = 0
+    for _, s in ipairs(plan) do
+      for i = 1, s.frames do
+        if i == 1 and s.reset then emu.softreset() end
+        if s.input then joypad.set(1, s.input) end
+        done = done + 1
+        if done == total then finish() end
+        emu.frameadvance()
+      end
+    end
+  end,
+  result = function(_) return emu.framecount() end,
+}
 
 handlers["emu.message"] = function(p)
   if type(p) ~= "table" or type(p.text) ~= "string" then
@@ -191,19 +247,19 @@ end
 -- Writes the emulated screen to a PNG via FCEUX's PNG encoder. Returns the
 -- absolute path and the framecount of the captured frame.
 --
--- gui.savescreenshotas is deferred: FCEUX queues the write to flush during
--- the next frame render. We advance one frame to force that flush so the
--- file exists by the time the response is sent. Side effect: capturing the
--- screen ticks the emulator by 1 frame.
-handlers["gui.screenshot"] = function(p)
-  local path = default_tmp_path("fceux-mcp-cap.png")
-  if type(p) == "table" and type(p.path) == "string" and #p.path > 0 then
-    path = p.path
-  end
-  gui.savescreenshotas(path)
-  emu.frameadvance()
-  return { path = path, framecount = emu.framecount() }
+-- gui.savescreenshotas is deferred: FCEUX writes the file at the start of its
+-- next FCEU_PutImage (video.cpp), which also runs while paused. So this job
+-- runs no frames: `start` (in the callback) asks for the file, and the reply
+-- goes out on the callback's next pass, after the file is written.
+local function screenshot_path(p)
+  if type(p) == "table" and type(p.path) == "string" and #p.path > 0 then return p.path end
+  return default_tmp_path("fceux-mcp-cap.png")
 end
+
+JOBS["gui.screenshot"] = {
+  start = function(p) gui.savescreenshotas(screenshot_path(p)) end,
+  result = function(p) return { path = screenshot_path(p), framecount = emu.framecount() } end,
+}
 
 ----------------------------------------------------------------------
 -- Additional handlers (savestate, loadrom, more memory/gui/rom)
@@ -220,21 +276,25 @@ handlers["emu.softreset"] = function(_)
   return { framecount = emu.framecount() }
 end
 
-handlers["emu.loadrom"] = function(p)
-  if type(p) ~= "table" or type(p.filename) ~= "string" then
-    bad_params("emu.loadrom: params.filename (string) required")
-  end
-  emu.loadrom(p.filename)
-  -- emu.loadrom is deferred: the actual ROM swap takes effect on the next
-  -- frame render. Advance one frame here to flush the swap so subsequent
-  -- reads (rom.getfilename, memory.*) see the new ROM. Same pattern as
-  -- gui.savescreenshotas. Side effect: each ROM switch ticks the timeline
-  -- by one frame.
-  emu.frameadvance()
-  -- FCEUX silently falls back to the most-recent ROM if the path can't
-  -- be loaded, so report what's actually loaded now.
-  return { filename = rom.getfilename(), framecount = emu.framecount() }
-end
+-- emu.loadrom is deferred: the actual ROM swap takes effect on the next
+-- frame render. The job runs one frame to flush the swap so subsequent reads
+-- (rom.getfilename, memory.*) see the new ROM. Side effect: each ROM switch
+-- ticks the timeline by one frame. FCEUX silently falls back to the
+-- most-recent ROM if the path can't be loaded, so the result reports what's
+-- actually loaded now.
+JOBS["emu.loadrom"] = {
+  check = function(p)
+    if type(p) ~= "table" or type(p.filename) ~= "string" then
+      bad_params("emu.loadrom: params.filename (string) required")
+    end
+  end,
+  run = function(p)
+    emu.loadrom(p.filename)
+    finish()
+    emu.frameadvance()
+  end,
+  result = function(_) return { filename = rom.getfilename(), framecount = emu.framecount() } end,
+}
 
 -- Savestates. Slot 1-10 uses FCEUX's persistent slots (saved to disk).
 -- Without a slot, save/load operate on a single shared anonymous state
@@ -418,14 +478,19 @@ end
 -- JSON request / response
 ----------------------------------------------------------------------
 
--- Methods whose handlers internally call emu.frameadvance (which yields).
--- Lua 5.1 cannot yield across a pcall boundary, so these run unprotected.
--- Their handlers must be written so they never error in practice.
-local YIELDING_METHODS = {
-  ["emu.step"] = true,
-  ["emu.loadrom"] = true,    -- frame-advances after load to flush the swap
-  ["gui.screenshot"] = true,
-}
+-- Methods switched off for this session. FCEUX_BRIDGE_DISABLE is a
+-- comma-separated list of method names (e.g. "lua.exec,memory.writebyte"),
+-- for a host that hands the bridge to an agent that must not change the game.
+local DISABLED = {}
+for m in (os.getenv("FCEUX_BRIDGE_DISABLE") or ""):gmatch("[^,%s]+") do DISABLED[m] = true end
+
+-- Asked for by emu.exit; done after its reply has gone out.
+local exit_requested = false
+
+handlers["emu.exit"] = function(_)
+  exit_requested = true
+  return true
+end
 
 -- Strip Lua's "<source>:<line>: " prefix from a runtime error message.
 local function clean_lua_error(s)
@@ -433,6 +498,17 @@ local function clean_lua_error(s)
   return (s:gsub("^[^:]+:%d+:%s*", ""))
 end
 
+local function error_response(id, err)
+  -- Structured error from bad_params(): { code = ..., message = ... }
+  if type(err) == "table" and type(err.code) == "string" then
+    return { id = id, error = { code = err.code, message = tostring(err.message or "") } }
+  end
+  -- Plain Lua runtime error: strip "file:line: " prefix to keep messages clean.
+  return { id = id, error = { code = "lua_error", message = clean_lua_error(err) } }
+end
+
+-- Returns the response, or nil when the request became a job: its reply goes
+-- out when the job is done (see poll).
 local function dispatch(req)
   if type(req) ~= "table" then
     return { id = json.null, error = { code = "parse_error", message = "request must be an object" } }
@@ -440,25 +516,33 @@ local function dispatch(req)
 
   local id = req.id
   local method = req.method
-  local handler = handlers[method]
 
+  if DISABLED[method] then
+    return { id = id, error = { code = "method_not_found", message = "'" .. tostring(method) .. "' is disabled (FCEUX_BRIDGE_DISABLE)" } }
+  end
+
+  local def = JOBS[method]
+  if def then
+    local ok, err = pcall(def.check or function() end, req.params)
+    if not ok then return error_response(id, err) end
+    job = { id = id, method = method, params = req.params, state = "queued" }
+    if def.start then
+      ok, err = pcall(def.start, req.params)
+      if not ok then job = nil; return error_response(id, err) end
+      job.state = "done"
+    else
+      emu.unpause()
+    end
+    return nil
+  end
+
+  local handler = handlers[method]
   if not handler then
     return { id = id, error = { code = "method_not_found", message = "no handler for '" .. tostring(method) .. "'" } }
   end
 
-  if YIELDING_METHODS[method] then
-    return { id = id, result = handler(req.params) }
-  end
-
   local ok, result = pcall(handler, req.params)
-  if not ok then
-    -- Structured error from bad_params(): { code = ..., message = ... }
-    if type(result) == "table" and type(result.code) == "string" then
-      return { id = id, error = { code = result.code, message = tostring(result.message or "") } }
-    end
-    -- Plain Lua runtime error: strip "file:line: " prefix to keep messages clean.
-    return { id = id, error = { code = "lua_error", message = clean_lua_error(result) } }
-  end
+  if not ok then return error_response(id, result) end
   return { id = id, result = result }
 end
 
@@ -497,7 +581,35 @@ local function close_client(reason)
   end
 end
 
-local function pump()
+local function send(resp)
+  -- Encode in a pcall: a handler may return a non-JSON-serializable value
+  -- (e.g. lua.exec returning a userdata or function). Fall back to an
+  -- error response in that case rather than failing the poll.
+  local ok, encoded = pcall(json.encode, resp)
+  if not ok then
+    encoded = json.encode({
+      id = resp.id,
+      error = { code = "lua_error",
+                message = "result is not JSON-serializable: " .. tostring(encoded) }
+    })
+  end
+  if not client then return end
+  local _, serr = client:send(encoded .. "\n")
+  if serr then close_client("send: " .. serr) end
+end
+
+-- Runs in the gui.register callback, on every pass of FCEUX's main loop.
+-- Never blocks: the socket is non-blocking.
+local function poll()
+  -- A job that is done replies first. Its last frame (or, for a job without
+  -- frames, FCEUX's deferred write) happened before this pass.
+  if job and job.state == "done" then
+    local def = JOBS[job.method]
+    local ok, result = pcall(def.result, job.params)
+    send(ok and { id = job.id, result = result } or error_response(job.id, result))
+    job = nil
+  end
+
   -- Accept new connection if we don't already have one.
   if not client then
     local c = server:accept()
@@ -520,28 +632,23 @@ local function pump()
     if rerr == "timeout" or not chunk or #chunk < 4096 then break end
   end
 
-  -- Process complete lines.
-  while true do
+  -- Process complete lines, one job at a time: while a job runs, the next
+  -- request waits in the buffer.
+  while not job do
     local nl = rxbuf:find("\n", 1, true)
     if not nl then break end
     local line = rxbuf:sub(1, nl - 1):gsub("\r$", "")
     rxbuf = rxbuf:sub(nl + 1)
     if #line > 0 then
       local resp = handle_line(line)
-      -- Encode in a pcall: a handler may return a non-JSON-serializable value
-      -- (e.g. lua.exec returning a userdata or function). Fall back to an
-      -- error response in that case rather than crashing the main loop.
-      local ok, encoded = pcall(json.encode, resp)
-      if not ok then
-        encoded = json.encode({
-          id = resp.id,
-          error = { code = "lua_error",
-                    message = "result is not JSON-serializable: " .. tostring(encoded) }
-        })
+      if resp then send(resp) end
+      if exit_requested then
+        -- emu.exit takes effect when the script next yields (lua-engine.cpp);
+        -- unpausing lets the main coroutine run and yield.
+        emu.exit()
+        emu.unpause()
+        return
       end
-      encoded = encoded .. "\n"
-      local _, serr = client:send(encoded)
-      if serr then close_client("send: " .. serr); return end
     end
   end
 end
@@ -550,19 +657,20 @@ end
 -- Main loop
 ----------------------------------------------------------------------
 
--- Prime: the first emu.frameadvance after a script loads acts as a yield-only
--- warm-up under FCEUX 2.6.6 (it does not bump emu.framecount), so do it once
--- here before any agent-driven step would otherwise see an off-by-one.
--- Skipped if no ROM is loaded yet — frameadvance with no ROM hangs forever.
--- The emu.loadrom handler does the same priming for each new ROM.
-if emu.emulating() then
-  emu.frameadvance()
-end
+gui.register(function()
+  local ok, perr = pcall(poll)
+  if not ok then print("bridge.lua: poll failed: " .. tostring(perr)) end
+end)
 
+-- The main coroutine only runs while FCEUX is unpaused: a job, or every
+-- frame in continuous mode. A job's run() returns at the start of a frame
+-- (its last emu.frameadvance resumed there), and that frame belongs to the
+-- next job, so it only yields when no job is queued.
+emu.pause()
 while true do
-  pump()
-  if paused then
-    socket.sleep(0.005)  -- bridge stays responsive while not advancing frames
+  if job and job.state == "queued" then
+    job.state = "running"
+    JOBS[job.method].run(job.params)
   else
     emu.frameadvance()
   end
