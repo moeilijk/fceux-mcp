@@ -1,5 +1,6 @@
 -- bridge.lua
--- Loaded into FCEUX via `fceux --loadlua bridge.lua <rom>`. Listens on a
+-- Loaded into FCEUX via `fceux --loadlua bridge.lua <rom>` (SDL builds) or
+-- `fceux.exe -lua C:\\full\\path\\bridge.lua <rom>` (Windows). Listens on a
 -- loopback TCP port and dispatches JSON requests to FCEUX's Lua API.
 --
 -- See docs/ARCHITECTURE.md for the design.
@@ -17,7 +18,7 @@ local PORT = tonumber(os.getenv("FCEUX_BRIDGE_PORT")) or 9999
 
 local function script_dir()
   local src = debug.getinfo(1, "S").source
-  return (src:match("@(.*/)")) or "./"
+  return (src:match("@(.*[/\\])")) or "./"
 end
 
 -- Default path for files we drop in the platform tmp dir. /tmp is universal
@@ -30,7 +31,10 @@ local function default_tmp_path(name)
   return "/tmp/" .. name
 end
 
+local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+
 local function detect_platform()
+  if IS_WINDOWS then return "windows" end
   local f = io.popen("uname -sm 2>/dev/null")
   if not f then return "macos-arm64" end
   local out = f:read("*a") or ""
@@ -55,7 +59,25 @@ package.path  = LSOCK   .. "/share/lua/5.1/?.lua;"
              .. JSONDIR .. "/?.lua;"
              .. package.path
 
-local socket = require("socket")
+-- The Windows build of FCEUX has LuaSocket 2.0.2's C core built in
+-- (package.preload["socket.core"], src/lua-engine.cpp) but not its Lua half
+-- (socket.lua), so socket.bind is missing there; it is rebuilt here from the
+-- core's own calls. Everywhere else the vendored LuaSocket is used.
+local socket
+if package.preload["socket.core"] then
+  socket = require("socket.core")
+  socket.bind = socket.bind or function(host, port, backlog)
+    local sock, err = socket.tcp()
+    if not sock then return nil, err end
+    sock:setoption("reuseaddr", true)
+    local ok, berr = sock:bind(host, port)
+    if not ok then return nil, berr end
+    sock:listen(backlog or 32)
+    return sock
+  end
+else
+  socket = require("socket")
+end
 local json   = require("json")
 
 ----------------------------------------------------------------------

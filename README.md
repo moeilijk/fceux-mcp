@@ -4,7 +4,7 @@ An MCP server that exposes the [FCEUX](https://fceux.com/) NES emulator's Lua AP
 
 ## How it works
 
-The MCP server (Python) spawns FCEUX with `fceux --loadlua bridge.lua <rom>`. The bridge script runs inside FCEUX's embedded Lua 5.1 interpreter, loads [LuaSocket](https://lunarmodules.github.io/luasocket/) from `vendor/`, opens a loopback TCP port, and dispatches JSON commands to FCEUX's `emu.*` / `memory.*` / `joypad.*` libraries. The server speaks MCP (JSON-RPC over stdio) to the client and TCP to the bridge.
+The MCP server (Python) spawns FCEUX with `fceux --loadlua bridge.lua <rom>` (on Windows: `fceux.exe -lua <absolute path to bridge.lua> <rom>`). The bridge script runs inside FCEUX's embedded Lua 5.1 interpreter, loads [LuaSocket](https://lunarmodules.github.io/luasocket/) from `vendor/` (on Windows FCEUX has it built in), opens a loopback TCP port, and dispatches JSON commands to FCEUX's `emu.*` / `memory.*` / `joypad.*` libraries. The server speaks MCP (JSON-RPC over stdio) to the client and TCP to the bridge.
 
 LuaSocket isn't part of FCEUX's Lua, so pre-built binaries are vendored under `vendor/luasocket/<platform>/` and `bridge.lua` adds them to `package.cpath` at startup.
 
@@ -14,7 +14,8 @@ If the server starts and finds the bridge port already listening, it skips the s
 
 - **macOS (Apple Silicon)** — `brew install fceux`. The repo ships pre-built LuaSocket for `macos-arm64`.
 - **Python 3.10+** — for the MCP server.
-- **Other platforms** — `vendor/luasocket/` currently only contains `macos-arm64` artifacts. For macOS Intel, Linux, or Windows, build LuaSocket for that platform and drop the files into `vendor/luasocket/<platform>/`. Recipe in [`vendor/luasocket/README.md`](./vendor/luasocket/README.md).
+- **Windows** — FCEUX 2.6.6 for Windows ([fceux.com](https://fceux.com)). Its Lua has LuaSocket's core built in, so nothing needs to be built; pass the executable with `--fceux C:\path\to\fceux.exe`.
+- **Other platforms** — `vendor/luasocket/` currently only contains `macos-arm64` artifacts. For macOS Intel or Linux, build LuaSocket for that platform and drop the files into `vendor/luasocket/<platform>/`. Recipe in [`vendor/luasocket/README.md`](./vendor/luasocket/README.md).
 
 ## Install
 
@@ -44,6 +45,7 @@ Flags:
 - `--port N` — bridge TCP port (default 9999). Also overridable via `FCEUX_BRIDGE_PORT` for the bridge side.
 - `--host HOST` — bridge host (default 127.0.0.1).
 - `--bridge-lua PATH` — override `bridge.lua` location (defaults to the one next to the package).
+- `--fceux PATH` — the FCEUX executable (default `fceux` on the `PATH`).
 
 ## Claude Code configuration
 
@@ -78,3 +80,4 @@ After either, restart `claude` (or run `/mcp` inside a session) and the 26 fceux
 ## Notes
 
 - Verified on macOS 15 / Apple Silicon with FCEUX 2.6.6 from Homebrew and Python 3.13.
+- Verified on Windows 11 with FCEUX 2.6.6 (win32): the bridge and the MCP tools (server on Python 3.12 under WSL, attached to the bridge). Not yet verified: the server spawning FCEUX from a Windows Python.
