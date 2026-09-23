@@ -84,4 +84,4 @@ After either, restart `claude` (or run `/mcp` inside a session) and the 26 fceux
 ## Notes
 
 - Verified on macOS 15 / Apple Silicon with FCEUX 2.6.6 from Homebrew and Python 3.13.
-- Verified on Windows 11 with FCEUX 2.6.6 (win32): the bridge, `emu.step` with `steps`, `gui.screenshot`, `emu.exit`, and the MCP tools (server on Python 3.12 under WSL, attached to the bridge). Not yet verified: the server spawning FCEUX from a Windows Python, and the new pausing on the macOS/Linux (Qt) build.
+- Verified on Windows 11 with FCEUX 2.6.6 (win32): the bridge, `emu.step` with `steps`, `gui.screenshot`, `emu.exit`, and the MCP server on Windows (Python 3.12.14) spawning FCEUX with `-lua` and closing it with `emu.exit`. Not yet verified: the new pausing on the macOS/Linux (Qt) build.
