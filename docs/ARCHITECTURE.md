@@ -18,14 +18,20 @@ Two processes. They are independent — FCEUX can be launched first and the MCP 
 ## Launch
 
 ```sh
-fceux --loadlua bridge.lua <rom>
+fceux --loadlua bridge.lua <rom>                          # SDL/Qt builds (macOS, Linux)
+fceux.exe -lua C:\full\path\to\bridge.lua <rom>          # Windows build
 ```
+
+The Windows build has no `--loadlua`; its option is `-lua <script>` (src/drivers/win/args.cpp), and every option takes a value. The script path should be absolute: FCEUX changes into the script's folder when it loads it.
+
 
 FCEUX boots, loads the ROM, and hands `bridge.lua` to its statically-linked Lua 5.1 interpreter. From that point on, `bridge.lua` runs inside FCEUX's Lua VM with full access to `emu.*`, `memory.*`, `joypad.*`, `gui.*`, etc.
 
 ## Loading LuaSocket from `vendor/`
 
-FCEUX's embedded Lua does not ship LuaSocket. We bundle pre-built LuaSocket binaries under `vendor/luasocket/<platform>/` (see [`vendor/luasocket/README.md`](../vendor/luasocket/README.md)) and load them at script startup.
+On Windows nothing is loaded from `vendor/`: the Windows build of FCEUX has the C core of LuaSocket 2.0.2 built in (`package.preload["socket.core"]`, src/lua-engine.cpp), but not its Lua half (`socket.lua`), so `socket.bind` is missing. `bridge.lua` uses `require("socket.core")` there and rebuilds `bind` from the core's `tcp()`, `bind` and `listen`.
+
+Elsewhere, FCEUX's embedded Lua does not ship LuaSocket. We bundle pre-built LuaSocket binaries under `vendor/luasocket/<platform>/` (see [`vendor/luasocket/README.md`](../vendor/luasocket/README.md)) and load them at script startup.
 
 ### Step 1 — extend Lua's module search paths
 
@@ -221,5 +227,5 @@ The Python server side has its own response-encode hardening: the bridge now wra
 
 - **Length-prefix framing.** Line-framed is fine while everything is small; binary payloads (e.g. screen captures) want length-prefix. Easy upgrade.
 - **Async / streaming responses.** Today it's strict request → response. Memory-watch hooks and frame-by-frame screen feeds will need server-pushed messages.
-- **Cross-platform vendor builds.** Only `macos-arm64` LuaSocket is shipped. Linux and Windows artifacts are not yet built.
+- **Cross-platform vendor builds.** Only `macos-arm64` LuaSocket is shipped; Windows needs none (built in). Linux artifacts are not yet built.
 - **Hot reload.** No way to restart `bridge.lua` without restarting FCEUX. Not a v1 concern.

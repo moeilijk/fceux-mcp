@@ -68,7 +68,7 @@ Alternatives considered: inline raw RGBA via `gui.gdscreenshot` (no disk I/O but
 Because the agent owns the timeline (paused-by-default + `emu.step`), the user has very little to do with the emulator's day-to-day operation — they're an observer of the FCEUX window, not a co-driver. So the MCP server owns FCEUX's process lifecycle:
 
 - On startup, the server probes the bridge port. If something is already listening (dev/debug case), it just attaches.
-- Otherwise the server spawns `fceux --loadlua bridge.lua <rom>` as a subprocess, polls the port until the bridge is listening (with a timeout), and then announces tools as available.
+- Otherwise the server spawns `fceux --loadlua bridge.lua <rom>` (on Windows `fceux.exe -lua <absolute path to bridge.lua> <rom>`; `--fceux` names the executable) as a subprocess, polls the port until the bridge is listening (with a timeout), and then announces tools as available.
 - ROM path comes from server config (Claude Desktop JSON / CLI flag / env var). Mid-session ROM switching is supported later via an `emu.loadrom` tool that wraps FCEUX's `emu.loadrom`.
 - On server shutdown the spawned FCEUX is terminated. If FCEUX crashes, the server respawns on the next tool call.
 

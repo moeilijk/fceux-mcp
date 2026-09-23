@@ -143,10 +143,15 @@ def wait_for_port(host: str, port: int, timeout_sec: float, interval: float = 0.
     return False
 
 
-def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int) -> subprocess.Popen:
+def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int, fceux: str = "fceux") -> subprocess.Popen:
     if not bridge_lua.exists():
         raise FileNotFoundError(f"bridge.lua not found: {bridge_lua}")
-    argv = ["fceux", "--loadlua", str(bridge_lua)]
+    # The Windows build has no --loadlua; it takes -lua <script>, and the
+    # script's path must be absolute (FCEUX changes into the script's folder).
+    if os.name == "nt":
+        argv = [fceux, "-lua", str(bridge_lua.resolve())]
+    else:
+        argv = [fceux, "--loadlua", str(bridge_lua)]
     if rom is not None:
         if not rom.exists():
             raise FileNotFoundError(f"ROM not found: {rom}")
@@ -378,6 +383,8 @@ def main() -> int:
                         help=f"bridge TCP port (default: {DEFAULT_PORT})")
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help=f"bridge host (default: {DEFAULT_HOST})")
+    parser.add_argument("--fceux", default="fceux",
+                        help="FCEUX executable (default: fceux on PATH; on Windows e.g. C:\\FCEUX\\fceux.exe)")
     parser.add_argument("--bridge-lua", type=Path, default=None,
                         help="path to bridge.lua (default: <repo>/bridge.lua next to this script)")
     args = parser.parse_args()
@@ -395,7 +402,7 @@ def main() -> int:
                   file=sys.stderr)
         else:
             print(f"[fceux-mcp] launching FCEUX with {rom}", file=sys.stderr)
-        fceux_proc = spawn_fceux(rom, bridge_lua, args.port)
+        fceux_proc = spawn_fceux(rom, bridge_lua, args.port, args.fceux)
         if not wait_for_port(args.host, args.port, BRIDGE_READY_TIMEOUT_SEC):
             print(f"[fceux-mcp] bridge did not start within {BRIDGE_READY_TIMEOUT_SEC}s",
                   file=sys.stderr)
