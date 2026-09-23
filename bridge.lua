@@ -362,6 +362,40 @@ handlers["savestate.load"] = function(p)
   return { framecount = emu.framecount() }
 end
 
+-- Savestates as files, for a host that keeps a session's state between runs of
+-- FCEUX. savestate.object(path) reads the file when it exists; savestate.persist
+-- writes the saved state to that path. persist() calls fopen/fwrite without a
+-- check (lua-engine.cpp LuaSaveState::persist), so the path is opened for
+-- writing here first, and the state is always saved before it is persisted.
+local function file_path(p, fn)
+  if type(p) ~= "table" or type(p.path) ~= "string" or #p.path == 0 then
+    bad_params(fn .. ": params.path (string) required")
+  end
+  return p.path
+end
+
+handlers["savestate.savefile"] = function(p)
+  local path = file_path(p, "savestate.savefile")
+  local f = io.open(path, "wb")
+  if not f then bad_params("savestate.savefile: cannot write " .. path) end
+  f:close()
+  local s = savestate.object(path)
+  savestate.save(s)
+  savestate.persist(s)
+  return { path = path, framecount = emu.framecount() }
+end
+
+handlers["savestate.loadfile"] = function(p)
+  local path = file_path(p, "savestate.loadfile")
+  local f = io.open(path, "rb")
+  if not f then bad_params("savestate.loadfile: no file " .. path) end
+  local size = f:seek("end")
+  f:close()
+  if size == 0 then bad_params("savestate.loadfile: " .. path .. " is empty") end
+  savestate.load(savestate.object(path))
+  return { path = path, framecount = emu.framecount() }
+end
+
 -- Memory: word reads + CPU register access
 handlers["memory.readword"] = function(p)
   if type(p) ~= "table" or type(p.address) ~= "number" then
