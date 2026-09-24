@@ -35,7 +35,7 @@ Three processes:
 MCP client  ──MCP/stdio──▶  Python server  ──TCP/JSON-lines──▶  FCEUX + bridge.lua
 ```
 
-- **`bridge.lua`** runs *inside* FCEUX's embedded Lua 5.1 (loaded via `fceux --loadlua`). It dispatches JSON requests to FCEUX's `emu.*` / `memory.*` / `joypad.*` / `gui.*` libraries. Loads vendored LuaSocket from `vendor/luasocket/<platform>/` to get TCP support; on Windows it uses the LuaSocket core that FCEUX's win32/win64 build preloads (`package.preload["socket.core"]`).
+- **`bridge.lua`** runs *inside* FCEUX's embedded Lua 5.1 (loaded via `fceux --loadlua`). It dispatches JSON requests to FCEUX's `emu.*` / `memory.*` / `joypad.*` / `gui.*` libraries. Loads vendored LuaSocket from `vendor/luasocket/<platform>/` to get TCP support; on Windows it uses the LuaSocket core that FCEUX's win32/win64 build preloads (`package.preload["socket.core"]`). Where no LuaSocket can load (FCEUX's win64-QtSDL build) it talks through files in a folder instead (ARCHITECTURE.md, "File transport").
 - **`fceux_mcp/__main__.py`** is a single-file Python server using the official `mcp` SDK's FastMCP. On startup it probes the bridge port: if listening, attaches; otherwise spawns FCEUX. Owns the FCEUX subprocess lifecycle.
 - **`vendor/`** is intentionally checked in — pre-built LuaSocket binaries and `rxi/json.lua`. Don't add system-level dependencies that the user has to install separately; vendor them.
 

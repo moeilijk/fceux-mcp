@@ -105,7 +105,19 @@ Trade-offs of this design:
 
 - **Latency.** While paused, a request waits up to one pass of FCEUX's loop, about 50 ms on Windows.
 - **Throughput.** Requests that don't run frames are handled in the same pass, as many as are buffered.
-- **Sound.** FCEUX makes sound only for emulated frames, so there can be a gap between two jobs. Measured on Windows with the win32 and the win64 build, against FCEUX's own playback of the same movie (OBS recording, gaps of 20 ms or more at -50 dB): steps of 600 frames give the same silences as FCEUX's own playback, with one extra gap of 64 ms in five steps on win64; steps of 60 frames a gap of 20–25 ms at about half of the steps; steps of 1 frame about 33 ms of silence after every step. Batch input into long steps when sound matters.
+- **Sound.** FCEUX makes sound only for emulated frames, so there can be a gap between two jobs. Measured on Windows with the win32 and the win64 build, against FCEUX's own playback of the same movie (OBS recording, gaps of 20 ms or more at -50 dB): steps of 600 frames give the same silences as FCEUX's own playback, with one extra gap of 64 ms in five steps on win64; steps of 60 frames a gap of 20–25 ms at about half of the steps; steps of 1 frame about 33 ms of silence after every step. The win64-QtSDL build, through the file transport: steps of 600 frames give no extra gap; steps of 60 frames a gap of 25–42 ms at 6 of 10 steps; steps of 1 frame give no sound at all, because the Qt build fades its sound to zero while paused and plays again only once its buffer is more than a quarter full (`fillaudio`, sdl-sound.cpp), which one frame between two pauses never fills. Batch input into long steps when sound matters.
+
+## File transport (FCEUX's Qt build on Windows)
+
+Every FCEUX build has Lua 5.1 compiled into its executable, and none exports Lua's C API (`fceux64.exe` exports only `luaopen_winapi`, `qfceux.exe` nothing). The win32 and win64 builds link LuaSocket 2.0.2 in with their other Lua extras (`luaperks.lib`, `vc/vc14_fceux.vcxproj`) and preload it (`package.preload["socket.core"]`, lua-engine.cpp, only in the Windows driver build); the win64-QtSDL build, built with CMake, has none of them. A C module such as LuaSocket cannot be added there: it needs Lua's C API from a DLL, and linked against a separate Lua DLL (the `lua5.1.dll` in the Qt zip, which `qfceux.exe` does not use) it runs a second Lua on FCEUX's state, and FCEUX ends with a heap corruption (0xc0000374, measured). `bridge.lua` therefore talks through files when LuaSocket cannot be loaded, with the same JSON lines:
+
+- The folder is `FCEUX_BRIDGE_DIR`, or `ipc` next to `bridge.lua`; the client creates it.
+- A client claims one of eight places by creating `client-<k>` exclusively, with a token of its own inside. The bridge reads the places every 30 passes (~0.5 s paused): a new token is a new client, a missing file a closed one. A place whose client has not touched it for 10 s is free for the next client.
+- Requests go to `<token>-in-<n>`, replies come back in `<token>-out-<n>` (n = 1, 2, ...), each written under another name and then renamed, so a file that exists is complete. Checking whether a file exists does not block, so this runs in the same pass of FCEUX's loop as the TCP server.
+- A client writes a batch as one file: FCEUX clears its drawing overlay at the first `gui.*` call of a pass after the previous drawing was shown (`gui_prepare`, lua-engine.cpp), so calls that land in different passes replace each other.
+- Measured from WSL over `/mnt/c`: 200 requests in 6.5 s, a median of 33 ms per request; FCEUX runs the `gui.register` callback about 62 times a second while paused.
+
+`fceux-mcp` uses files by itself when `--fceux` is `qfceux.exe` on Windows, or when `--bridge-dir` names the folder.
 
 ## Wire protocol
 
@@ -164,8 +176,8 @@ Initial handler set (v1):
 | `emu.message` | Show a message in FCEUX's overlay |
 | `emu.poweron` | Hard reset (NES power cycle) |
 | `emu.softreset` | Soft reset |
-| `emu.loadrom` (`filename`) | Switch ROMs mid-session; returns the loaded `{filename, framecount}`. In FCEUX's Windows build immediate, no frames; elsewhere one frame (see gotchas). A file the bridge cannot open is refused with `invalid_params`: FCEUX's Windows build would show a modal error window and then reload its most recent ROM from power-on |
-| `emu.reload` | Windows: the current ROM again, from power-on, through FCEUX's own ReloadRom. Unlike `emu.poweron` ("Power on" over the game) a load clears FCEUX's messages. No frames. The Qt build's `emu.loadrom` needs a file name, so there the bridge answers `invalid_params`; use `emu.loadrom` with the ROM's path |
+| `emu.loadrom` (`filename`) | Switch ROMs mid-session; returns the loaded `{filename, framecount}`. In FCEUX's Windows build immediate, no frames; in the Qt build the emulator thread takes the load a frame or more later, so the job runs frames until the frame count starts again (at most 120; measured on win64-QtSDL). A file the bridge cannot open is refused with `invalid_params`: FCEUX's Windows build would show a modal error window and then reload its most recent ROM from power-on |
+| `emu.reload` | Windows: the current ROM again, from power-on, through FCEUX's own ReloadRom. Unlike `emu.poweron` ("Power on" over the game) a load clears FCEUX's messages. No frames. The Qt build's `emu.loadrom` needs a file name, so there the bridge answers `invalid_params`; `fceux-mcp`'s `emu_reload` then loads the ROM it loaded last again |
 
 **Memory**
 
@@ -199,7 +211,7 @@ Initial handler set (v1):
 | --- | --- |
 | `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Runs no frames (see gotchas). FCEUX shows "Snapshot Saved." over the game |
 | `gui.screen` | The emulated screen before anything is drawn over it (FCEUX's messages, Lua overlays), from `gui.gdscreenshot(true)`: `{width, height, rgb}` with `rgb` as base64 (3 bytes a pixel). No file, no message, no frames |
-| `gui.text` (`x, y, text, color?`) | Draw text on the overlay. It stays on screen while FCEUX is paused and is cleared after the next frame that runs (`FCEU_LuaGui`, lua-engine.cpp); a `gui.*` call in a later pass of FCEUX's loop replaces what was drawn before (`gui_prepare`), so send what belongs together in one batch. Measured on the win32 and win64 builds |
+| `gui.text` (`x, y, text, color?`) | Draw text on the overlay. It stays on screen while FCEUX is paused and is cleared after the next frame that runs (`FCEU_LuaGui`, lua-engine.cpp); a `gui.*` call in a later pass of FCEUX's loop replaces what was drawn before (`gui_prepare`), so send what belongs together in one batch. Measured on the win32, win64 and win64-QtSDL builds |
 | `gui.box` (`x1, y1, x2, y2, fillcolor?, outlinecolor?`) | Draw a rectangle, kept like `gui.text` |
 | `gui.pixel` (`x, y, color?`) | Draw one pixel, kept like `gui.text`; seen on screen on the win32 and win64 builds |
 

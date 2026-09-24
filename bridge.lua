@@ -32,6 +32,11 @@ local function default_tmp_path(name)
 end
 
 local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+-- The Windows driver build (win32, win64) preloads its built-in LuaSocket core;
+-- the Qt build (macOS, Linux, and win64-QtSDL on Windows) does not
+-- (src/lua-engine.cpp, #if defined(__WIN_DRIVER__)). Read before anything
+-- requires it.
+local IS_WIN_DRIVER = package.preload["socket.core"] ~= nil
 
 local function detect_platform()
   if IS_WINDOWS then return "windows" end
@@ -76,7 +81,13 @@ if package.preload["socket.core"] then
     return sock
   end
 else
-  socket = require("socket")
+  -- FCEUX's Qt build on Windows (win64-QtSDL) ships no LuaSocket: only the
+  -- Windows driver build links it in (luaperks.lib). Every FCEUX build has
+  -- Lua compiled into its executable without exporting Lua's C API, so no C
+  -- module such as LuaSocket can be added either; the bridge then talks
+  -- through files instead (see "File transport" below).
+  local ok, mod = pcall(require, "socket")
+  socket = ok and mod or nil
 end
 local json   = require("json")
 
@@ -306,7 +317,7 @@ end
 -- emu.loadrom. In the Windows driver build it is immediate: FCEUX's
 -- emu.loadrom calls ALoad, which loads the ROM, powers it on and clears FCEUX's
 -- on-screen messages (lua-engine.cpp, fceu.cpp FCEUI_LoadGame), so it runs no
--- frames there. In the Qt build the swap is handed to
+-- frames there. In the Qt build (win64-QtSDL included) the swap is handed to
 -- the emulator thread and takes effect on the next frame render
 -- (LoadGameFromLua), so the job runs one frame to flush it; side effect: each
 -- ROM switch ticks the timeline by one frame there. A file FCEUX cannot open
@@ -322,7 +333,7 @@ local function check_rom_path(p)
   f:close()
 end
 
-if IS_WINDOWS then
+if IS_WIN_DRIVER then
   handlers["emu.loadrom"] = function(p)
     check_rom_path(p)
     emu.loadrom(p.filename)
@@ -343,8 +354,19 @@ else
   end
   JOBS["emu.loadrom"] = {
     check = check_rom_path,
+    -- The emulator thread takes the load a frame or more later (measured on
+    -- win64-QtSDL: the reply after one frame still showed the old frame
+    -- count), so the job runs frames until the frame count starts again, at
+    -- most 120; from frame 0 or 1 a new start would not show, so it first
+    -- runs two.
     run = function(p)
+      if emu.framecount() < 2 then emu.frameadvance(); emu.frameadvance() end
+      local before = emu.framecount()
       emu.loadrom(p.filename)
+      for _ = 1, 120 do
+        emu.frameadvance()
+        if emu.framecount() < before then break end
+      end
       finish()
       emu.frameadvance()
     end,
@@ -646,18 +668,57 @@ local function handle_line(line)
 end
 
 ----------------------------------------------------------------------
--- TCP server
+-- Transports: TCP (LuaSocket), or files where LuaSocket cannot load
 ----------------------------------------------------------------------
 
-local server, err = socket.bind(HOST, PORT)
-if not server then
-  emu.message("bridge.lua: bind failed: " .. tostring(err))
-  error("bridge.lua: bind failed: " .. tostring(err))
+local server
+if socket then
+  local err
+  server, err = socket.bind(HOST, PORT)
+  if not server then
+    emu.message("bridge.lua: bind failed: " .. tostring(err))
+    error("bridge.lua: bind failed: " .. tostring(err))
+  end
+  server:settimeout(0)
+  local listen_ip, listen_port = server:getsockname()
+  emu.message(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
+  print(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
 end
-server:settimeout(0)
-local listen_ip, listen_port = server:getsockname()
-emu.message(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
-print(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
+
+-- File transport. The same JSON lines, through files in one folder:
+-- FCEUX_BRIDGE_DIR, or "ipc" next to this script. A client claims one of
+-- FILE_SLOTS places by creating client-<k> exclusively, with a token of its
+-- own inside; it writes requests to <token>-in-<n> and reads replies from
+-- <token>-out-<n> (n = 1, 2, ...), each file written under another name and
+-- then renamed, so a file that exists is complete. Removing client-<k> closes
+-- the client. Checking whether a file exists does not block, so this runs in
+-- the same pass of FCEUX's loop as the TCP server.
+local FILE_DIR = os.getenv("FCEUX_BRIDGE_DIR") or (HERE .. "ipc")
+if FILE_DIR:sub(-1) ~= "/" and FILE_DIR:sub(-1) ~= "\\" then FILE_DIR = FILE_DIR .. (IS_WINDOWS and "\\" or "/") end
+local FILE_SLOTS = 8
+local FILE_SCAN_PASSES = 30  -- the slots are read every 30 passes (~0.5 s paused)
+local file_pass = FILE_SCAN_PASSES
+if not socket then
+  emu.message("bridge.lua: no LuaSocket here; talking through files in " .. FILE_DIR)
+  print("bridge.lua: no LuaSocket here; talking through files in " .. FILE_DIR)
+end
+
+local function read_file(name)
+  local f = io.open(name, "rb")
+  if not f then return nil end
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+local function write_file(name, data)
+  local tmp = name .. ".tmp"
+  local f = io.open(tmp, "wb")
+  if not f then return false end
+  f:write(data)
+  f:close()
+  return os.rename(tmp, name) ~= nil
+end
 
 -- Several clients at once, each with its own receive buffer: a host may have
 -- more than one process talking to the bridge (one that plays, one that saves
@@ -665,11 +726,11 @@ print(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
 -- first pass after it arrives. Jobs still run one at a time: while one runs,
 -- every client's next request waits in its buffer, and a job's reply goes to
 -- the client that asked for it.
-local clients = {}   -- list of { sock = ..., rxbuf = "", outbuf = "" }
+local clients = {}   -- list of { sock = ... } or { slot, token, inseq, outseq }, with rxbuf and outbuf
 
 local function close_client(c, reason)
   if reason then print("bridge.lua: client closed (" .. reason .. ")") end
-  pcall(function() c.sock:close() end)
+  if c.sock then pcall(function() c.sock:close() end) end
   for i, other in ipairs(clients) do
     if other == c then table.remove(clients, i); break end
   end
@@ -681,6 +742,13 @@ end
 -- rest goes out on the next passes of FCEUX's loop.
 local function flush(c)
   if c.closed or #c.outbuf == 0 then return end
+  if c.token then
+    if write_file(FILE_DIR .. c.token .. "-out-" .. c.outseq, c.outbuf) then
+      c.outseq = c.outseq + 1
+      c.outbuf = ""
+    end
+    return
+  end
   local i, err, last = c.sock:send(c.outbuf)
   local sent = i or last or 0
   if sent > 0 then c.outbuf = c.outbuf:sub(sent + 1) end
@@ -729,7 +797,7 @@ local function poll()
   for _, c in ipairs(clients) do flush(c) end
 
   -- Accept every waiting connection.
-  while true do
+  while server do
     local s = server:accept()
     if not s then break end
     s:settimeout(0)
@@ -737,10 +805,36 @@ local function poll()
     print("bridge.lua: client connected")
   end
 
+  -- File clients: a new token in client-<k> is a new client, a missing file a
+  -- closed one.
+  file_pass = file_pass + 1
+  if not socket and file_pass >= FILE_SCAN_PASSES then
+    file_pass = 0
+    for k = 1, FILE_SLOTS do
+      local token = read_file(FILE_DIR .. "client-" .. k)
+      token = token and token:match("^%s*(%w+)")
+      local known
+      for _, c in ipairs(clients) do if c.slot == k and not c.closed then known = c end end
+      if known and known.token ~= token then known.closed = true; known = nil end
+      if token and not known then
+        clients[#clients + 1] = { slot = k, token = token, inseq = 1, outseq = 1, rxbuf = "", outbuf = "" }
+        print("bridge.lua: file client " .. k .. " connected")
+      end
+    end
+  end
+
   -- Drain whatever bytes are available right now (non-blocking).
   for i = #clients, 1, -1 do
     local c = clients[i]
-    while true do
+    while c.token and not c.closed do
+      local name = FILE_DIR .. c.token .. "-in-" .. c.inseq
+      local data = read_file(name)
+      if not data then break end
+      os.remove(name)
+      c.rxbuf = c.rxbuf .. data
+      c.inseq = c.inseq + 1
+    end
+    while c.sock do
       local data, rerr, partial = c.sock:receive(4096)
       local chunk = data or partial
       if chunk and #chunk > 0 then c.rxbuf = c.rxbuf .. chunk end

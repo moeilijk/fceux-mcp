@@ -128,3 +128,8 @@ The current design, which this would replace: a bridge-local pause flag with a m
 
 Open because it reverses the gotcha that `emu.pause()` blocks the frame loop entirely, including the pump (CLAUDE.md): with the pump in a `gui.register` callback, FCEUX's own pause no longer blocks it. Measured only on Windows (FCEUX 2.6.6 win32 and win64); not yet tried on macOS, where it needs FCEUX's Qt build to run the callback while paused.
 
+### Transport: files where LuaSocket cannot load?
+
+FCEUX's win64-QtSDL build ships no LuaSocket, and no C module can be added to it: Lua is compiled into `qfceux.exe` without its C API exported, and LuaSocket linked against a separate Lua DLL runs a second Lua on FCEUX's state (a heap corruption, measured). The proposal: when `require("socket")` fails, `bridge.lua` talks through files in a folder (`FCEUX_BRIDGE_DIR`, or `ipc` next to `bridge.lua`), with the same JSON lines. A client claims one of eight slots with a token of its own; requests and replies are numbered files, each written under another name and renamed. It uses only Lua's own `io`, so it needs no vendoring; `fceux-mcp` uses it by itself for `qfceux.exe`, or with `--bridge-dir`. See ARCHITECTURE.md, "File transport".
+
+Open because it is a second transport beside "Bridge transport — decided: TCP via LuaSocket". Alternatives looked at: a named pipe through `io.open` (a read blocks FCEUX until a request arrives), and LuaSocket built for Windows (the heap corruption above). Measured on Windows only, with the win64-QtSDL build: TASVideos movie 3728 in sync, a median of 33 ms per request from WSL.
