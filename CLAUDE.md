@@ -56,7 +56,7 @@ These are real, not theoretical — every one cost a debugging round during brin
 - A paused FCEUX does not resume the script's main coroutine, so requests are read in a `gui.register` callback, which FCEUX runs on every pass of its main loop, paused or not; a job unpauses FCEUX for its frames and pauses it again (ARCHITECTURE.md, "Frame loop").
 - The first `emu.frameadvance` after script load is a yield-only warm-up that doesn't increment `framecount`. The main loop parks in it while FCEUX is paused, so the first job counts from frame 0.
 - `gui.savescreenshotas` is deferred until the next frame render. `gui.screenshot` advances one frame to flush.
-- `savestate.persist` crashes the embedded Lua and `savestate.object(N)` returns a fresh handle each call. The handlers cache a single object per slot for the script's lifetime.
+- `savestate.persist` writes without checking `fopen`/`fwrite`, so it crashes the embedded Lua on a state never saved or an unwritable path; only `savestate.savefile` calls it, after opening the path and saving first. `savestate.object(N)` returns a fresh handle each call; the slot handlers cache a single object per slot for the script's lifetime.
 - An *attempted* yield across pcall corrupts FCEUX's frame loop (subsequent `emu.frameadvance` calls hang). `lua.exec` shadows `emu.frameadvance` in a sandboxed environment via `setfenv` so the agent's code errors *before* any yield is attempted.
 
 ## Conventions

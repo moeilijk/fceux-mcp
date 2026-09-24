@@ -314,8 +314,9 @@ local function require_slot(p, fn)
 end
 
 -- Two FCEUX 2.6.6 quirks shape the savestate handlers below:
---   1. savestate.persist crashes the embedded Lua, so we can't make a
---      single state survive across multiple loads via that route.
+--   1. savestate.persist crashes the embedded Lua on a state never saved or
+--      an unwritable path (it does not check fopen/fwrite), so the slots do
+--      not use it; savestate.savefile below does, with both cases ruled out.
 --   2. savestate.object(N) returns a fresh handle each call, so a save
 --      via one call to object(N) and a load via another call to object(N)
 --      operate on different objects — the load sees no state.
