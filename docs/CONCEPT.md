@@ -56,12 +56,6 @@ Tools:
 - `emu.step(steps=[{buttons, frames, reset}])` — the same, holding each step's buttons for its frames. `joypad.set` applies to the next frame only, so holding a button through a multi-frame `emu.step(frames=N)` is not possible; with `steps` the bridge sets all eight buttons on every frame. Measured on Windows: a published FM2 movie (TASVideos #3728, 67,117 frames) played through `steps` of up to 600 frames matches FCEUX's own playback of it on every checked frame.
 - `emu.pause` / `emu.unpause` / `emu.paused` — FCEUX's own pause. `unpause` switches into real-time mode (NTSC ~60 Hz) for cases like recording a demo or watching a run. `pause` returns to step-only.
 
-### Pausing — decided: FCEUX's own pause, requests read from `gui.register`
-
-Between requests FCEUX itself is paused, and the bridge reads its socket from a `gui.register` callback, which FCEUX runs on every pass of its main loop, paused or not. A request that runs frames unpauses FCEUX for exactly those frames. See ARCHITECTURE.md, "Frame loop and TCP server".
-
-Rejected: the earlier design, a bridge-local pause flag with a main loop that polls the socket and sleeps without yielding. It never hands control back to FCEUX while paused, so FCEUX pumps no window messages: on Windows the window stops redrawing, is marked "Not Responding" after 5 s, and cannot be closed until the script yields.
-
 Alternative considered and rejected: an `advance_until(condition)` tool that resolves when a memory address matches a value. Expressive but defers logic to the bridge that's better expressed as a step-and-poll loop on the agent side; revisit if a real workload needs it.
 
 ### Screen capture format — decided: PNG via temp file path
@@ -126,4 +120,11 @@ v1 should target the long-lived session — it's what makes "play this game" fea
 
 ## Open questions
 
-(none currently — see commit history for resolved questions; new ones will be added here as they come up.)
+### Pausing: FCEUX's own pause, requests read from `gui.register`?
+
+Between requests FCEUX itself is paused, and the bridge reads its socket from a `gui.register` callback, which FCEUX runs on every pass of its main loop, paused or not. A request that runs frames unpauses FCEUX for exactly those frames. See ARCHITECTURE.md, "Frame loop and TCP server".
+
+The current design, which this would replace: a bridge-local pause flag with a main loop that polls the socket and sleeps without yielding. It never hands control back to FCEUX while paused, so FCEUX pumps no window messages: on Windows the window stops redrawing, is marked "Not Responding" after 5 s, and cannot be closed until the script yields.
+
+Open because it reverses the gotcha that `emu.pause()` blocks the frame loop entirely, including the pump (CLAUDE.md): with the pump in a `gui.register` callback, FCEUX's own pause no longer blocks it. Measured only on Windows (FCEUX 2.6.6 win32 and win64); not yet tried on macOS, where it needs FCEUX's Qt build to run the callback while paused.
+

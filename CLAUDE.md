@@ -44,7 +44,7 @@ MCP client  ──MCP/stdio──▶  Python server  ──TCP/JSON-lines──�
 The pattern, end-to-end:
 
 1. **Lua side (`bridge.lua`)** — add `handlers["foo.bar"] = function(p) ... end`. Validate inputs with the `bad_params(msg)` helper; it throws a typed table that `dispatch` turns into an `invalid_params` error response. Plain `error("…")` becomes `lua_error`.
-2. **Yielding handlers go in `YIELDING_METHODS`.** If your handler calls `emu.frameadvance` (directly or transitively), add the method name to that set so `dispatch` skips `pcall` for it. **Lua 5.1 cannot yield across `pcall` and an attempted-and-failed yield corrupts FCEUX's frame loop** (see ARCHITECTURE.md gotchas) — this is non-negotiable. Handlers in `YIELDING_METHODS` run unprotected; they must be written so they never error in normal operation.
+2. **Handlers that run frames are jobs.** If your handler calls `emu.frameadvance` (directly or transitively), put it in `JOBS` (`check`, `run`, `result`) instead of `handlers`. `poll()` runs in the `gui.register` callback and must never yield; a job's `run` runs in the main coroutine, unprotected, and calls `finish()` right before its last `emu.frameadvance`, after which `poll()` sends the reply. **Lua 5.1 cannot yield across `pcall` and an attempted-and-failed yield corrupts FCEUX's frame loop** (see ARCHITECTURE.md gotchas) — this is non-negotiable. `check` validates the params beforehand, so `run` must not error in normal operation.
 3. **Python side (`fceux_mcp/__main__.py`)** — add a thin `@mcp.tool()` wrapper inside `build_server` that calls `client.call("foo.bar", params)`. Use Python type hints; FastMCP turns them into the tool's JSON schema. The docstring becomes the tool description visible to the agent — make it good.
 4. **Update [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**'s handler table.
 
@@ -53,8 +53,8 @@ The pattern, end-to-end:
 These are real, not theoretical — every one cost a debugging round during bring-up. The short version:
 
 - FCEUX's `tostring` is non-standard — concatenates *all* arguments. `vendor/json/json.lua` is patched to wrap booleans in a 1-arg shim.
-- FCEUX's `emu.pause()` blocks the frame loop entirely, including our pump. The `emu.pause`/`unpause` handlers manipulate a bridge-local flag instead.
-- The first `emu.frameadvance` after script load is a yield-only warm-up that doesn't increment `framecount`. The bridge primes once before the main loop.
+- A paused FCEUX does not resume the script's main coroutine, so requests are read in a `gui.register` callback, which FCEUX runs on every pass of its main loop, paused or not; a job unpauses FCEUX for its frames and pauses it again (ARCHITECTURE.md, "Frame loop").
+- The first `emu.frameadvance` after script load is a yield-only warm-up that doesn't increment `framecount`. The main loop parks in it while FCEUX is paused, so the first job counts from frame 0.
 - `gui.savescreenshotas` is deferred until the next frame render. `gui.screenshot` advances one frame to flush.
 - `savestate.persist` crashes the embedded Lua and `savestate.object(N)` returns a fresh handle each call. The handlers cache a single object per slot for the script's lifetime.
 - An *attempted* yield across pcall corrupts FCEUX's frame loop (subsequent `emu.frameadvance` calls hang). `lua.exec` shadows `emu.frameadvance` in a sandboxed environment via `setfenv` so the agent's code errors *before* any yield is attempted.
