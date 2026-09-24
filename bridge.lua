@@ -32,6 +32,11 @@ local function default_tmp_path(name)
 end
 
 local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+-- The Windows driver build (win32, win64) preloads its built-in LuaSocket core;
+-- the Qt build (macOS, Linux, and win64-QtSDL on Windows) does not
+-- (src/lua-engine.cpp, #if defined(__WIN_DRIVER__)). Read before anything
+-- requires it.
+local IS_WIN_DRIVER = package.preload["socket.core"] ~= nil
 
 local function detect_platform()
   if IS_WINDOWS then return "windows" end
@@ -59,10 +64,10 @@ package.path  = LSOCK   .. "/share/lua/5.1/?.lua;"
              .. JSONDIR .. "/?.lua;"
              .. package.path
 
--- The Windows build of FCEUX has LuaSocket 2.0.2's C core built in
+-- The win32 and win64 builds of FCEUX have LuaSocket 2.0.2's C core built in
 -- (package.preload["socket.core"], src/lua-engine.cpp) but not its Lua half
 -- (socket.lua), so socket.bind is missing there; it is rebuilt here from the
--- core's own calls. Everywhere else the vendored LuaSocket is used.
+-- core's own calls. On macOS and Linux the vendored LuaSocket is used.
 local socket
 if package.preload["socket.core"] then
   socket = require("socket.core")
@@ -76,7 +81,13 @@ if package.preload["socket.core"] then
     return sock
   end
 else
-  socket = require("socket")
+  -- FCEUX's Qt build on Windows (win64-QtSDL) ships no LuaSocket: only the
+  -- Windows driver build links it in (luaperks.lib). Every FCEUX build has
+  -- Lua compiled into its executable without exporting Lua's C API, so no C
+  -- module such as LuaSocket can be added either; the bridge then talks
+  -- through files instead (see "File transport" below).
+  local ok, mod = pcall(require, "socket")
+  socket = ok and mod or nil
 end
 local json   = require("json")
 
@@ -261,6 +272,33 @@ JOBS["gui.screenshot"] = {
   result = function(p) return { path = screenshot_path(p), framecount = emu.framecount() } end,
 }
 
+-- The emulated screen as RGB, from gui.gdscreenshot(true): FCEUX's own copy
+-- of the frame before anything is drawn over it (XBackBuf, lua-engine.cpp), so
+-- no message, Lua overlay or "Snapshot Saved." is in it, and FCEUX shows no
+-- message for it either. Returns { width, height, rgb } with rgb as base64:
+-- each pixel is 3 bytes, so exactly one base64 quartet. Runs no frames.
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64_12 = {}
+for v = 0, 4095 do
+  local hi, lo = math.floor(v / 64), v % 64
+  B64_12[v] = B64:sub(hi + 1, hi + 1) .. B64:sub(lo + 1, lo + 1)
+end
+
+handlers["gui.screen"] = function(_)
+  local gd = gui.gdscreenshot(true)
+  -- GD truecolor header: 2 bytes signature, 2 bytes width, 2 bytes height, then 5 more; pixels are A,R,G,B.
+  local width = gd:byte(3) * 256 + gd:byte(4)
+  local height = gd:byte(5) * 256 + gd:byte(6)
+  local out = {}
+  local byte, floor = string.byte, math.floor
+  for p = 0, width * height - 1 do
+    local r, g, b = byte(gd, 13 + p * 4, 15 + p * 4)
+    local v = r * 65536 + g * 256 + b
+    out[p + 1] = B64_12[floor(v / 4096)] .. B64_12[v % 4096]
+  end
+  return { width = width, height = height, rgb = table.concat(out) }
+end
+
 ----------------------------------------------------------------------
 -- Additional handlers (savestate, loadrom, more memory/gui/rom)
 ----------------------------------------------------------------------
@@ -276,25 +314,65 @@ handlers["emu.softreset"] = function(_)
   return { framecount = emu.framecount() }
 end
 
--- emu.loadrom is deferred: the actual ROM swap takes effect on the next
--- frame render. The job runs one frame to flush the swap so subsequent reads
--- (rom.getfilename, memory.*) see the new ROM. Side effect: each ROM switch
--- ticks the timeline by one frame. FCEUX silently falls back to the
--- most-recent ROM if the path can't be loaded, so the result reports what's
--- actually loaded now.
-JOBS["emu.loadrom"] = {
-  check = function(p)
-    if type(p) ~= "table" or type(p.filename) ~= "string" then
-      bad_params("emu.loadrom: params.filename (string) required")
-    end
-  end,
-  run = function(p)
+-- emu.loadrom. In the Windows driver build it is immediate: FCEUX's
+-- emu.loadrom calls ALoad, which loads the ROM, powers it on and clears FCEUX's
+-- on-screen messages (lua-engine.cpp, fceu.cpp FCEUI_LoadGame), so it runs no
+-- frames there. In the Qt build (win64-QtSDL included) the swap is handed to
+-- the emulator thread and takes effect on the next frame render
+-- (LoadGameFromLua), so the job runs one frame to flush it; side effect: each
+-- ROM switch ticks the timeline by one frame there. A file FCEUX cannot open
+-- is refused here: the Windows driver build would show a modal error window
+-- and then reload its most recent ROM from power-on.
+local function loaded_rom() return { filename = rom.getfilename(), framecount = emu.framecount() } end
+local function check_rom_path(p)
+  if type(p) ~= "table" or type(p.filename) ~= "string" then
+    bad_params("emu.loadrom: params.filename (string) required")
+  end
+  local f = io.open(p.filename, "rb")
+  if not f then bad_params("emu.loadrom: cannot open " .. p.filename) end
+  f:close()
+end
+
+if IS_WIN_DRIVER then
+  handlers["emu.loadrom"] = function(p)
+    check_rom_path(p)
     emu.loadrom(p.filename)
-    finish()
-    emu.frameadvance()
-  end,
-  result = function(_) return { filename = rom.getfilename(), framecount = emu.framecount() } end,
-}
+    return loaded_rom()
+  end
+  -- The loaded ROM again, from power-on: FCEUX's own ReloadRom (emu.loadrom
+  -- without a file name). Unlike emu.poweron, which shows "Power on" over the
+  -- game, a load clears FCEUX's messages.
+  handlers["emu.reload"] = function(_)
+    emu.loadrom()
+    return loaded_rom()
+  end
+else
+  -- The Qt build's emu.loadrom needs a file name (no reload without one), and
+  -- its Lua does not know the full path of the loaded ROM.
+  handlers["emu.reload"] = function(_)
+    bad_params("emu.reload: not in FCEUX's Qt build; use emu.loadrom with the ROM's path")
+  end
+  JOBS["emu.loadrom"] = {
+    check = check_rom_path,
+    -- The emulator thread takes the load a frame or more later (measured on
+    -- win64-QtSDL: the reply after one frame still showed the old frame
+    -- count), so the job runs frames until the frame count starts again, at
+    -- most 120; from frame 0 or 1 a new start would not show, so it first
+    -- runs two.
+    run = function(p)
+      if emu.framecount() < 2 then emu.frameadvance(); emu.frameadvance() end
+      local before = emu.framecount()
+      emu.loadrom(p.filename)
+      for _ = 1, 120 do
+        emu.frameadvance()
+        if emu.framecount() < before then break end
+      end
+      finish()
+      emu.frameadvance()
+    end,
+    result = function(_) return loaded_rom() end,
+  }
+end
 
 -- Savestates. Slot 1-10 uses FCEUX's persistent slots (saved to disk).
 -- Without a slot, save/load operate on a single shared anonymous state
@@ -589,33 +667,94 @@ local function handle_line(line)
 end
 
 ----------------------------------------------------------------------
--- TCP server
+-- Transports: TCP (LuaSocket), or files where LuaSocket cannot load
 ----------------------------------------------------------------------
 
-local server, err = socket.bind(HOST, PORT)
-if not server then
-  emu.message("bridge.lua: bind failed: " .. tostring(err))
-  error("bridge.lua: bind failed: " .. tostring(err))
+local server
+if socket then
+  local err
+  server, err = socket.bind(HOST, PORT)
+  if not server then
+    emu.message("bridge.lua: bind failed: " .. tostring(err))
+    error("bridge.lua: bind failed: " .. tostring(err))
+  end
+  server:settimeout(0)
+  local listen_ip, listen_port = server:getsockname()
+  emu.message(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
+  print(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
 end
-server:settimeout(0)
-local listen_ip, listen_port = server:getsockname()
-emu.message(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
-print(string.format("bridge.lua listening on %s:%d", listen_ip, listen_port))
 
--- One client at a time for v1.
-local client = nil
-local rxbuf  = ""
+-- File transport. The same JSON lines, through files in one folder:
+-- FCEUX_BRIDGE_DIR, or "ipc" next to this script. A client claims one of
+-- FILE_SLOTS places by creating client-<k> exclusively, with a token of its
+-- own inside; it writes requests to <token>-in-<n> and reads replies from
+-- <token>-out-<n> (n = 1, 2, ...), each file written under another name and
+-- then renamed, so a file that exists is complete. Removing client-<k> closes
+-- the client. Checking whether a file exists does not block, so this runs in
+-- the same pass of FCEUX's loop as the TCP server.
+local FILE_DIR = os.getenv("FCEUX_BRIDGE_DIR") or (HERE .. "ipc")
+if FILE_DIR:sub(-1) ~= "/" and FILE_DIR:sub(-1) ~= "\\" then FILE_DIR = FILE_DIR .. (IS_WINDOWS and "\\" or "/") end
+local FILE_SLOTS = 8
+local FILE_SCAN_PASSES = 30  -- the slots are read every 30 passes (~0.5 s paused)
+local file_pass = FILE_SCAN_PASSES
+if not socket then
+  emu.message("bridge.lua: no LuaSocket here; talking through files in " .. FILE_DIR)
+  print("bridge.lua: no LuaSocket here; talking through files in " .. FILE_DIR)
+end
 
-local function close_client(reason)
-  if client then
-    if reason then print("bridge.lua: client closed (" .. reason .. ")") end
-    pcall(function() client:close() end)
-    client = nil
-    rxbuf  = ""
+local function read_file(name)
+  local f = io.open(name, "rb")
+  if not f then return nil end
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+local function write_file(name, data)
+  local tmp = name .. ".tmp"
+  local f = io.open(tmp, "wb")
+  if not f then return false end
+  f:write(data)
+  f:close()
+  return os.rename(tmp, name) ~= nil
+end
+
+-- Several clients at once, each with its own receive buffer: a host may have
+-- more than one process talking to the bridge (one that plays, one that saves
+-- states), and each keeps its connection open, so a request is read on the
+-- first pass after it arrives. Jobs still run one at a time: while one runs,
+-- every client's next request waits in its buffer, and a job's reply goes to
+-- the client that asked for it.
+local clients = {}   -- list of { sock = ... } or { slot, token, inseq, outseq }, with rxbuf and outbuf
+
+local function close_client(c, reason)
+  if reason then print("bridge.lua: client closed (" .. reason .. ")") end
+  if c.sock then pcall(function() c.sock:close() end) end
+  for i, other in ipairs(clients) do
+    if other == c then table.remove(clients, i); break end
   end
 end
 
-local function send(resp)
+-- Sends what the socket takes now. The sockets are non-blocking, and a large
+-- reply (gui.screen, ~245 KB) does not fit in the send buffer at once: LuaSocket
+-- then returns nil, "timeout" and the index of the last byte sent, and the
+-- rest goes out on the next passes of FCEUX's loop.
+local function flush(c)
+  if c.closed or #c.outbuf == 0 then return end
+  if c.token then
+    if write_file(FILE_DIR .. c.token .. "-out-" .. c.outseq, c.outbuf) then
+      c.outseq = c.outseq + 1
+      c.outbuf = ""
+    end
+    return
+  end
+  local i, err, last = c.sock:send(c.outbuf)
+  local sent = i or last or 0
+  if sent > 0 then c.outbuf = c.outbuf:sub(sent + 1) end
+  if err and err ~= "timeout" then c.closed = true; close_client(c, "send: " .. err) end
+end
+
+local function send(c, resp)
   -- Encode in a pcall: a handler may return a non-JSON-serializable value
   -- (e.g. lua.exec returning a userdata or function). Fall back to an
   -- error response in that case rather than failing the poll.
@@ -627,63 +766,111 @@ local function send(resp)
                 message = "result is not JSON-serializable: " .. tostring(encoded) }
     })
   end
-  if not client then return end
-  local _, serr = client:send(encoded .. "\n")
-  if serr then close_client("send: " .. serr) end
+  if not c or c.closed then return end
+  c.outbuf = c.outbuf .. encoded .. "\n"
+  flush(c)
+end
+
+-- Takes one complete line from the client's buffer, or nil.
+local function next_line(c)
+  local nl = c.rxbuf:find("\n", 1, true)
+  if not nl then return nil end
+  local line = c.rxbuf:sub(1, nl - 1):gsub("\r$", "")
+  c.rxbuf = c.rxbuf:sub(nl + 1)
+  return line
 end
 
 -- Runs in the gui.register callback, on every pass of FCEUX's main loop.
--- Never blocks: the socket is non-blocking.
+-- Never blocks: the sockets are non-blocking.
 local function poll()
   -- A job that is done replies first. Its last frame (or, for a job without
   -- frames, FCEUX's deferred write) happened before this pass.
   if job and job.state == "done" then
     local def = JOBS[job.method]
     local ok, result = pcall(def.result, job.params)
-    send(ok and { id = job.id, result = result } or error_response(job.id, result))
+    send(job.client, ok and { id = job.id, result = result } or error_response(job.id, result))
     job = nil
   end
 
-  -- Accept new connection if we don't already have one.
-  if not client then
-    local c = server:accept()
-    if c then
-      c:settimeout(0)
-      client = c
-      rxbuf  = ""
-      print("bridge.lua: client connected")
-    end
+  -- What did not fit in a send buffer before goes out first.
+  for _, c in ipairs(clients) do flush(c) end
+
+  -- Accept every waiting connection.
+  while server do
+    local s = server:accept()
+    if not s then break end
+    s:settimeout(0)
+    clients[#clients + 1] = { sock = s, rxbuf = "", outbuf = "" }
+    print("bridge.lua: client connected")
   end
 
-  if not client then return end
-
-  -- Drain whatever bytes are available right now (non-blocking).
-  while true do
-    local data, rerr, partial = client:receive(4096)
-    local chunk = data or partial
-    if chunk and #chunk > 0 then rxbuf = rxbuf .. chunk end
-    if rerr == "closed" then close_client("eof"); return end
-    if rerr == "timeout" or not chunk or #chunk < 4096 then break end
-  end
-
-  -- Process complete lines, one job at a time: while a job runs, the next
-  -- request waits in the buffer.
-  while not job do
-    local nl = rxbuf:find("\n", 1, true)
-    if not nl then break end
-    local line = rxbuf:sub(1, nl - 1):gsub("\r$", "")
-    rxbuf = rxbuf:sub(nl + 1)
-    if #line > 0 then
-      local resp = handle_line(line)
-      if resp then send(resp) end
-      if exit_requested then
-        -- emu.exit takes effect when the script next yields (lua-engine.cpp);
-        -- unpausing lets the main coroutine run and yield.
-        emu.exit()
-        emu.unpause()
-        return
+  -- File clients: a new token in client-<k> is a new client, a missing file a
+  -- closed one.
+  file_pass = file_pass + 1
+  if not socket and file_pass >= FILE_SCAN_PASSES then
+    file_pass = 0
+    for k = 1, FILE_SLOTS do
+      local token = read_file(FILE_DIR .. "client-" .. k)
+      token = token and token:match("^%s*(%w+)")
+      local known
+      for _, c in ipairs(clients) do if c.slot == k and not c.closed then known = c end end
+      if known and known.token ~= token then known.closed = true; known = nil end
+      if token and not known then
+        clients[#clients + 1] = { slot = k, token = token, inseq = 1, outseq = 1, rxbuf = "", outbuf = "" }
+        print("bridge.lua: file client " .. k .. " connected")
       end
     end
+  end
+
+  -- Drain whatever bytes are available right now (non-blocking).
+  for i = #clients, 1, -1 do
+    local c = clients[i]
+    while c.token and not c.closed do
+      local name = FILE_DIR .. c.token .. "-in-" .. c.inseq
+      local data = read_file(name)
+      if not data then break end
+      os.remove(name)
+      c.rxbuf = c.rxbuf .. data
+      c.inseq = c.inseq + 1
+    end
+    while c.sock do
+      local data, rerr, partial = c.sock:receive(4096)
+      local chunk = data or partial
+      if chunk and #chunk > 0 then c.rxbuf = c.rxbuf .. chunk end
+      if rerr == "closed" then
+        -- Requests that arrived before the close are still handled below.
+        c.closed = true
+        break
+      end
+      if rerr == "timeout" or not chunk or #chunk < 4096 then break end
+    end
+  end
+
+  -- Handle complete lines, client by client, until a job starts: while a
+  -- job runs, the next requests wait in their buffers.
+  for _, c in ipairs(clients) do
+    while not job do
+      local line = next_line(c)
+      if not line then break end
+      if #line > 0 then
+        local resp = handle_line(line)
+        if resp then send(c, resp) elseif job then job.client = c end
+        if exit_requested then
+          -- emu.exit takes effect when the script next yields (lua-engine.cpp);
+          -- unpausing lets the main coroutine run and yield.
+          emu.exit()
+          emu.unpause()
+          return
+        end
+      end
+    end
+    if job then break end
+  end
+
+  -- Forget clients that closed and have nothing left to handle.
+  for i = #clients, 1, -1 do
+    local c = clients[i]
+    if c.closed and not c.rxbuf:find("\n", 1, true) and not (job and job.client == c) then close_client(c, "eof") end
   end
 end
 

@@ -10,12 +10,14 @@ to it instead of spawning (handy for development).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +124,111 @@ class BridgeClient:
         return line.decode()
 
 
+class FileBridgeClient:
+    """The same JSON lines through files, for FCEUX's Qt build on Windows
+    (win64-QtSDL): it ships no LuaSocket, and its Lua does not export its C API,
+    so none can be loaded; bridge.lua then talks through files in a folder
+    (bridge.lua, "File transport"). A client claims one of FILE_SLOTS places
+    by creating client-<k> exclusively with a token of its own, writes requests
+    to <token>-in-<n> and reads replies from <token>-out-<n>; each file is
+    written under another name and renamed. A place whose client has not
+    touched it for FILE_STALE_SEC is free again."""
+
+    FILE_SLOTS = 8
+    FILE_STALE_SEC = 10.0
+
+    def __init__(self, directory: Path, timeout: float = 30.0) -> None:
+        self._dir = directory
+        self._timeout = timeout
+        self._slot: Path | None = None
+        self._token = ""
+        self._inseq = 1
+        self._outseq = 1
+        self._buf = ""
+        self._next_id = 1
+        self._touched = 0.0
+
+    def connect(self) -> None:
+        if self._slot is not None:
+            return
+        self._dir.mkdir(parents=True, exist_ok=True)
+        token = os.urandom(8).hex()
+        for k in range(1, self.FILE_SLOTS + 1):
+            slot = self._dir / f"client-{k}"
+            try:
+                if slot.exists() and time.time() - slot.stat().st_mtime > self.FILE_STALE_SEC:
+                    slot.unlink(missing_ok=True)
+                with open(slot, "x") as f:
+                    f.write(token)
+            except FileExistsError:
+                continue
+            self._slot, self._token = slot, token
+            self._inseq = self._outseq = 1
+            self._buf = ""
+            self._touched = time.monotonic()
+            return
+        raise BridgeUnreachable(f"the bridge's {self.FILE_SLOTS} file slots in {self._dir} are all taken")
+
+    def close(self) -> None:
+        if self._slot is None:
+            return
+        self._slot.unlink(missing_ok=True)
+        for f in self._dir.glob(f"{self._token}-*"):
+            f.unlink(missing_ok=True)
+        self._slot = None
+
+    def call(self, method: str, params: dict | None = None, timeout: float | None = None) -> Any:
+        self.connect()
+        rid = self._next_id
+        self._next_id += 1
+        req: dict[str, Any] = {"id": rid, "method": method}
+        if params:
+            req["params"] = params
+        name = self._dir / f"{self._token}-in-{self._inseq}"
+        self._inseq += 1
+        tmp = name.with_name(name.name + ".tmp")
+        tmp.write_text(json.dumps(req) + "\n")
+        tmp.replace(name)
+        deadline = time.monotonic() + (timeout or self._timeout)
+        while True:
+            while "\n" in self._buf:
+                line, _, self._buf = self._buf.partition("\n")
+                msg = json.loads(line)
+                if msg.get("id") != rid:
+                    continue
+                if "error" in msg:
+                    err = msg["error"]
+                    raise BridgeError(err.get("code", "lua_error"), err.get("message", ""))
+                return msg.get("result")
+            out = self._dir / f"{self._token}-out-{self._outseq}"
+            try:
+                data = out.read_text()
+            except (FileNotFoundError, PermissionError):
+                # PermissionError: Windows refuses the read while bridge.lua's
+                # rename of the file still holds it (measured); the next try reads it.
+                if time.monotonic() > deadline:
+                    raise BridgeUnreachable(f"no answer to {method} through {self._dir}")
+                if time.monotonic() - self._touched > 2 and self._slot is not None:
+                    os.utime(self._slot)
+                    self._touched = time.monotonic()
+                time.sleep(0.002)
+                continue
+            out.unlink(missing_ok=True)
+            self._outseq += 1
+            self._buf += data
+
+
+def wait_for_file_bridge(client: FileBridgeClient, timeout_sec: float) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        try:
+            if client.call("ping", timeout=1.0) == "pong":
+                return True
+        except BridgeError:
+            client.close()
+    return False
+
+
 # ---------------------------------------------------------------------------
 # FCEUX launch / port readiness
 # ---------------------------------------------------------------------------
@@ -143,13 +250,22 @@ def wait_for_port(host: str, port: int, timeout_sec: float, interval: float = 0.
     return False
 
 
-def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int, fceux: str = "fceux") -> subprocess.Popen:
+def is_qt_on_windows(fceux: str) -> bool:
+    """FCEUX's Qt build on Windows (qfceux.exe, win64-QtSDL)."""
+    return os.name == "nt" and Path(fceux).name.lower().startswith("qfceux")
+
+
+def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int, fceux: str = "fceux",
+                bridge_dir: Path | None = None) -> subprocess.Popen:
     if not bridge_lua.exists():
         raise FileNotFoundError(f"bridge.lua not found: {bridge_lua}")
-    # The Windows build has no --loadlua; it takes -lua <script>, and the
-    # script's path must be absolute (FCEUX changes into the script's folder).
-    if os.name == "nt":
+    # FCEUX's Windows build (fceux.exe, fceux64.exe) has no --loadlua; it takes
+    # -lua <script>, and the script's path must be absolute (FCEUX changes into
+    # the script's folder). The Qt build (qfceux.exe on Windows) takes --loadlua.
+    if os.name == "nt" and not is_qt_on_windows(fceux):
         argv = [fceux, "-lua", str(bridge_lua.resolve())]
+    elif os.name == "nt":
+        argv = [fceux, "--loadlua", str(bridge_lua.resolve())]
     else:
         argv = [fceux, "--loadlua", str(bridge_lua)]
     if rom is not None:
@@ -157,6 +273,8 @@ def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int, fceux: str = "fce
             raise FileNotFoundError(f"ROM not found: {rom}")
         argv.append(str(rom))
     env = {**os.environ, "FCEUX_BRIDGE_PORT": str(port)}
+    if bridge_dir is not None:
+        env["FCEUX_BRIDGE_DIR"] = str(bridge_dir.resolve())
     return subprocess.Popen(
         argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -166,7 +284,20 @@ def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int, fceux: str = "fce
 # MCP tools
 # ---------------------------------------------------------------------------
 
-def build_server(client: BridgeClient) -> FastMCP:
+def rgb_to_png(width: int, height: int, rgb: bytes) -> bytes:
+    """A PNG (8-bit RGB, no alpha) from raw pixels, with the standard library only."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return len(data).to_bytes(4, "big") + kind + data + zlib.crc32(kind + data).to_bytes(4, "big")
+    stride = width * 3
+    rows = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride] for y in range(height))
+    ihdr = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+
+def build_server(client: BridgeClient | FileBridgeClient, rom: Path | None = None) -> FastMCP:
+    # The ROM loaded now, when known: FCEUX's Qt build has no reload without a
+    # file name, and emu_reload then loads this one again.
+    loaded = {"rom": rom.resolve() if rom is not None else None}
     mcp = FastMCP("fceux-mcp")
 
     @mcp.tool()
@@ -245,6 +376,14 @@ def build_server(client: BridgeClient) -> FastMCP:
         return client.call("joypad.set", {"player": player, "input": buttons})
 
     @mcp.tool()
+    def gui_screen() -> Image:
+        """The emulated screen as PNG, before FCEUX draws anything over it (its
+        messages, Lua overlays). Runs no frames and writes no file."""
+        result = client.call("gui.screen")
+        png = rgb_to_png(result["width"], result["height"], base64.b64decode(result["rgb"]))
+        return Image(data=png, format="png")
+
+    @mcp.tool()
     def gui_screenshot() -> Image:
         """Capture the current emulated screen as PNG. Runs no frames: FCEUX writes
         the file on its next screen update, which also happens while paused."""
@@ -264,12 +403,27 @@ def build_server(client: BridgeClient) -> FastMCP:
         return client.call("emu.softreset")
 
     @mcp.tool()
+    def emu_reload() -> dict:
+        """Load the current ROM again, from power-on. Unlike emu_poweron,
+        which shows "Power on" over the game, a load clears FCEUX's on-screen
+        messages. On FCEUX's Windows build it runs no frames; on the Qt build,
+        which has no reload without a file name, the ROM this server loaded
+        last is loaded again."""
+        try:
+            return client.call("emu.reload")
+        except BridgeError as e:
+            if e.code != "invalid_params" or loaded["rom"] is None:
+                raise
+            return client.call("emu.loadrom", {"filename": str(loaded["rom"])})
+
+    @mcp.tool()
     def emu_loadrom(filename: str) -> dict:
-        """Load a different ROM. Path is resolved relative to bridge.lua or
-        as absolute. Note: if the path can't be loaded, FCEUX silently falls
-        back to the most-recent ROM; the returned `filename` is what's
-        actually loaded so the caller can detect that case."""
-        return client.call("emu.loadrom", {"filename": filename})
+        """Load a different ROM, from power-on. Path is resolved relative to
+        bridge.lua or as absolute. A file the bridge cannot open is refused
+        (invalid_params); the returned `filename` is what's loaded now."""
+        result = client.call("emu.loadrom", {"filename": filename})
+        loaded["rom"] = Path(filename)
+        return result
 
     # --- Savestates ---------------------------------------------------------
 
@@ -292,6 +446,16 @@ def build_server(client: BridgeClient) -> FastMCP:
         anonymous state isn't fresh."""
         params = {"slot": slot} if slot is not None else None
         return client.call("savestate.load", params)
+
+    @mcp.tool()
+    def savestate_savefile(path: str) -> dict:
+        """Save the current state to a file (FCEUX's own savestate format)."""
+        return client.call("savestate.savefile", {"path": path})
+
+    @mcp.tool()
+    def savestate_loadfile(path: str) -> dict:
+        """Restore a state from a file written by savestate_savefile."""
+        return client.call("savestate.loadfile", {"path": path})
 
     # --- Memory: word reads + CPU registers ---------------------------------
 
@@ -401,12 +565,26 @@ def main() -> int:
                         help="FCEUX executable (default: fceux on PATH; on Windows e.g. C:\\FCEUX\\fceux.exe)")
     parser.add_argument("--bridge-lua", type=Path, default=None,
                         help="path to bridge.lua (default: <repo>/bridge.lua next to this script)")
+    parser.add_argument("--bridge-dir", type=Path, default=None,
+                        help="talk to the bridge through files in this folder instead of TCP "
+                             "(default for FCEUX's Qt build on Windows, qfceux.exe: ipc next to bridge.lua)")
     args = parser.parse_args()
 
     bridge_lua = args.bridge_lua or (Path(__file__).resolve().parent.parent / "bridge.lua")
+    bridge_dir = args.bridge_dir or (bridge_lua.resolve().parent / "ipc" if is_qt_on_windows(args.fceux) else None)
 
     fceux_proc: subprocess.Popen | None = None
-    if is_port_open(args.host, args.port):
+    if bridge_dir is not None:
+        client: BridgeClient | FileBridgeClient = FileBridgeClient(bridge_dir)
+        rom = args.rom or BUNDLED_DUMMY_ROM
+        print(f"[fceux-mcp] launching FCEUX with {rom}; talking through files in {bridge_dir}", file=sys.stderr)
+        fceux_proc = spawn_fceux(rom, bridge_lua, args.port, args.fceux, bridge_dir)
+        if not wait_for_file_bridge(client, BRIDGE_READY_TIMEOUT_SEC):
+            print(f"[fceux-mcp] bridge did not answer within {BRIDGE_READY_TIMEOUT_SEC}s", file=sys.stderr)
+            client.close()
+            fceux_proc.terminate()
+            return 1
+    elif is_port_open(args.host, args.port):
         print(f"[fceux-mcp] attaching to existing bridge on {args.host}:{args.port}", file=sys.stderr)
     else:
         rom = args.rom or BUNDLED_DUMMY_ROM
@@ -423,10 +601,11 @@ def main() -> int:
             fceux_proc.terminate()
             return 1
 
-    client = BridgeClient(args.host, args.port)
-    client.connect()
+    if bridge_dir is None:
+        client = BridgeClient(args.host, args.port)
+        client.connect()
 
-    mcp = build_server(client)
+    mcp = build_server(client, args.rom or (BUNDLED_DUMMY_ROM if fceux_proc is not None else None))
     try:
         mcp.run()
     finally:
