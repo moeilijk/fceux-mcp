@@ -10,12 +10,14 @@ to it instead of spawning (handy for development).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +168,16 @@ def spawn_fceux(rom: Path | None, bridge_lua: Path, port: int, fceux: str = "fce
 # MCP tools
 # ---------------------------------------------------------------------------
 
+def rgb_to_png(width: int, height: int, rgb: bytes) -> bytes:
+    """A PNG (8-bit RGB, no alpha) from raw pixels, with the standard library only."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return len(data).to_bytes(4, "big") + kind + data + zlib.crc32(kind + data).to_bytes(4, "big")
+    stride = width * 3
+    rows = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride] for y in range(height))
+    ihdr = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+
 def build_server(client: BridgeClient) -> FastMCP:
     mcp = FastMCP("fceux-mcp")
 
@@ -245,6 +257,14 @@ def build_server(client: BridgeClient) -> FastMCP:
         return client.call("joypad.set", {"player": player, "input": buttons})
 
     @mcp.tool()
+    def gui_screen() -> Image:
+        """The emulated screen as PNG, before FCEUX draws anything over it (its
+        messages, Lua overlays). Runs no frames and writes no file."""
+        result = client.call("gui.screen")
+        png = rgb_to_png(result["width"], result["height"], base64.b64decode(result["rgb"]))
+        return Image(data=png, format="png")
+
+    @mcp.tool()
     def gui_screenshot() -> Image:
         """Capture the current emulated screen as PNG. Runs no frames: FCEUX writes
         the file on its next screen update, which also happens while paused."""
@@ -264,11 +284,17 @@ def build_server(client: BridgeClient) -> FastMCP:
         return client.call("emu.softreset")
 
     @mcp.tool()
+    def emu_reload() -> dict:
+        """Load the current ROM again, from power-on (Windows only). Unlike
+        emu_poweron, which shows "Power on" over the game, a load clears
+        FCEUX's on-screen messages. Runs no frames."""
+        return client.call("emu.reload")
+
+    @mcp.tool()
     def emu_loadrom(filename: str) -> dict:
-        """Load a different ROM. Path is resolved relative to bridge.lua or
-        as absolute. Note: if the path can't be loaded, FCEUX silently falls
-        back to the most-recent ROM; the returned `filename` is what's
-        actually loaded so the caller can detect that case."""
+        """Load a different ROM, from power-on. Path is resolved relative to
+        bridge.lua or as absolute. A file the bridge cannot open is refused
+        (invalid_params); the returned `filename` is what's loaded now."""
         return client.call("emu.loadrom", {"filename": filename})
 
     # --- Savestates ---------------------------------------------------------
@@ -292,6 +318,16 @@ def build_server(client: BridgeClient) -> FastMCP:
         anonymous state isn't fresh."""
         params = {"slot": slot} if slot is not None else None
         return client.call("savestate.load", params)
+
+    @mcp.tool()
+    def savestate_savefile(path: str) -> dict:
+        """Save the current state to a file (FCEUX's own savestate format)."""
+        return client.call("savestate.savefile", {"path": path})
+
+    @mcp.tool()
+    def savestate_loadfile(path: str) -> dict:
+        """Restore a state from a file written by savestate_savefile."""
+        return client.call("savestate.loadfile", {"path": path})
 
     # --- Memory: word reads + CPU registers ---------------------------------
 

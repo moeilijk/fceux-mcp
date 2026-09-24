@@ -99,13 +99,13 @@ Why it works (FCEUX 2.6.6 source):
 - While paused, FCEUX's main loop keeps calling `FCEUI_Emulate`, which draws the last frame through `FCEU_PutImage` → `FCEU_LuaGui` (fceu.cpp, video.cpp), and that runs the `gui.register` callback. On Windows the loop then pumps window messages and sleeps 50 ms (drivers/win/main.cpp); on Qt the emulator thread does the same through `fceuWrapperUpdate` → `DoFun`. So the window, sound and close keep working, and `poll()` runs about 20 times a second.
 - A paused FCEUX does not resume the script's main coroutine: `FCEUI_Emulate` returns before `FCEU_LuaFrameBoundary`. A request that runs frames (a *job*: `emu.step`, `emu.loadrom`) therefore unpauses FCEUX, and the main coroutine runs it at the start of the next frame, before that frame's input is read, so a `joypad.set` there applies to that frame.
 - A job calls `finish()` right before its last `emu.frameadvance`: that pauses FCEUX again (unless the agent chose real-time mode) and marks the job done. The frame is still emulated, and `poll()` sends the reply on its next pass. A job of N frames runs exactly N frames.
-- `poll()` is non-blocking (the sockets have timeout 0) and never yields; it handles one job at a time, and while a job runs the next request waits in the buffer.
+- `poll()` is non-blocking (the sockets have timeout 0) and never yields. It serves several clients at once, each with its own buffer (a host may play from one process and save states from another), and runs one job at a time: while a job runs, every client's next request waits in its buffer, and the job's reply goes to the client that asked. A client should keep its connection open: a new connection is accepted on one pass and its request read on the next, a pass of ~50 ms more per request while paused (measured on Windows: gaps in the sound of 66-91 ms per 60-frame call with a connection per call, 20-34 ms with one kept open).
 
 Trade-offs of this design:
 
 - **Latency.** While paused, a request waits up to one pass of FCEUX's loop, about 50 ms on Windows.
 - **Throughput.** Requests that don't run frames are handled in the same pass, as many as are buffered.
-- **Sound.** FCEUX makes sound only for emulated frames, so there is a gap between two jobs. Measured on Windows (OBS recording, gaps of 20 ms or more at -50 dB): steps of 600 frames give one gap of about 30 ms per step, steps of 60 frames one of 20–34 ms per step, and steps of 1 frame give 33–43 ms of silence every ~51 ms. Batch input into long steps when sound matters.
+- **Sound.** FCEUX makes sound only for emulated frames, so there can be a gap between two jobs. Measured on Windows with the win32 and the win64 build, against FCEUX's own playback of the same movie (OBS recording, gaps of 20 ms or more at -50 dB): steps of 600 frames give the same silences as FCEUX's own playback, with one extra gap of 64 ms in five steps on win64; steps of 60 frames a gap of 20–25 ms at about half of the steps; steps of 1 frame about 33 ms of silence after every step. Batch input into long steps when sound matters.
 
 ## Wire protocol
 
@@ -164,7 +164,8 @@ Initial handler set (v1):
 | `emu.message` | Show a message in FCEUX's overlay |
 | `emu.poweron` | Hard reset (NES power cycle) |
 | `emu.softreset` | Soft reset |
-| `emu.loadrom` (`filename`) | Switch ROMs mid-session; returns the loaded `{filename, framecount}` |
+| `emu.loadrom` (`filename`) | Switch ROMs mid-session; returns the loaded `{filename, framecount}`. In FCEUX's Windows build immediate, no frames; elsewhere one frame (see gotchas). A file the bridge cannot open is refused with `invalid_params`: FCEUX's Windows build would show a modal error window and then reload its most recent ROM from power-on |
+| `emu.reload` | Windows: the current ROM again, from power-on, through FCEUX's own ReloadRom. Unlike `emu.poweron` ("Power on" over the game) a load clears FCEUX's messages. No frames. The Qt build's `emu.loadrom` needs a file name, so there the bridge answers `invalid_params`; use `emu.loadrom` with the ROM's path |
 
 **Memory**
 
@@ -196,10 +197,11 @@ Initial handler set (v1):
 
 | Method | Description |
 | --- | --- |
-| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Runs no frames (see gotchas) |
-| `gui.text` (`x, y, text, color?`) | Draw text on overlay. One-shot per call; FCEUX clears between frames |
-| `gui.box` (`x1, y1, x2, y2, fillcolor?, outlinecolor?`) | Draw a rectangle. One-shot |
-| `gui.pixel` (`x, y, color?`) | Draw one pixel. One-shot |
+| `gui.screenshot` (`path?`) | Write the emulated screen as PNG; returns `{path, framecount}`. Runs no frames (see gotchas). FCEUX shows "Snapshot Saved." over the game |
+| `gui.screen` | The emulated screen before anything is drawn over it (FCEUX's messages, Lua overlays), from `gui.gdscreenshot(true)`: `{width, height, rgb}` with `rgb` as base64 (3 bytes a pixel). No file, no message, no frames |
+| `gui.text` (`x, y, text, color?`) | Draw text on the overlay. It stays on screen while FCEUX is paused and is cleared after the next frame that runs (`FCEU_LuaGui`, lua-engine.cpp); a `gui.*` call in a later pass of FCEUX's loop replaces what was drawn before (`gui_prepare`), so send what belongs together in one batch. Measured on the win32 and win64 builds |
+| `gui.box` (`x1, y1, x2, y2, fillcolor?, outlinecolor?`) | Draw a rectangle, kept like `gui.text` |
+| `gui.pixel` (`x, y, color?`) | Draw one pixel, kept like `gui.text`; seen on screen on the win32 and win64 builds |
 
 **ROM**
 
@@ -230,7 +232,7 @@ Adding a new method is a one-line entry in the dispatch table — see `bridge.lu
 - **`savestate.persist` can crash the embedded Lua.** The docs say it makes a state survive across loads, but calling it under FCEUX 2.6.6 took the bridge down. `LuaSaveState::persist` (lua-engine.cpp) calls `fopen` and `fwrite` on the state's data without checking either, so it takes FCEUX down on a state that was never saved or a path that cannot be written. The slot handlers therefore don't call it — anonymous saves end up single-use (FCEUX deletes the state on load), and slots stay in-memory rather than being written to disk. `savestate.savefile` does call it, avoiding both cases: it opens the path for writing first and always saves before it persists (measured on Windows: a state saved this way loads the same RAM after FCEUX was closed and started again).
 - **`savestate.object(N)` returns a fresh handle each call.** A save through one handle and a load through another (even for the same slot N) operate on different objects — the load sees no state. The handlers cache one savestate object per slot for the script's lifetime so save and load see the same handle, which makes slots 1-10 reusable across many save/load cycles within a session.
 - **An *attempted* yield across pcall corrupts FCEUX's frame loop.** Calling `emu.frameadvance` from inside a pcall'd handler not only fails with `attempt to yield across metamethod/C-call boundary` (expected for Lua 5.1), but also leaves FCEUX in a state where subsequent `emu.frameadvance` calls hang indefinitely. The frames of `emu.step` and `emu.loadrom` therefore run in the main coroutine, outside any pcall. For `lua.exec`, which runs *inside* pcall and lets the agent write arbitrary code, we shadow `emu.frameadvance` in a sandboxed environment so it errors *before* any yield is attempted — keeping FCEUX healthy.
-- **`emu.loadrom` is deferred AND can't recover from a no-ROM state.** Two related quirks: (1) calling `emu.loadrom` queues the swap for the next frame render, so a follow-up `rom.getfilename` would still see the old ROM unless we advance a frame first — the handler does that internally, same pattern as `gui.savescreenshotas`. (2) `emu.loadrom` invoked when **no** ROM was loaded at startup crashes the FCEUX process entirely; spawning FCEUX bare with `--loadlua` works, but the agent can never recover because any loadrom kills the emulator. The Python server therefore always launches FCEUX with *something* loaded — either the user-supplied `--rom` or a bundled minimal NES ROM (`fceux_mcp/data/dummy.nes`); the agent's first `emu_loadrom` then transitions cleanly between two loaded ROMs.
+- **`emu.loadrom` is deferred on the Qt build AND can't recover from a no-ROM state.** Two related quirks: (1) on the Qt build (macOS, Linux) `emu.loadrom` queues the swap for the next frame render (`LoadGameFromLua`), so a follow-up `rom.getfilename` would still see the old ROM unless we advance a frame first — the job does that there. On Windows `emu.loadrom` calls `ALoad` directly and the swap is done when it returns (lua-engine.cpp), so no frame is run. (2) `emu.loadrom` invoked when **no** ROM was loaded at startup crashes the FCEUX process entirely; spawning FCEUX bare with `--loadlua` works, but the agent can never recover because any loadrom kills the emulator. The Python server therefore always launches FCEUX with *something* loaded — either the user-supplied `--rom` or a bundled minimal NES ROM (`fceux_mcp/data/dummy.nes`); the agent's first `emu_loadrom` then transitions cleanly between two loaded ROMs.
 
 The Python server side has its own response-encode hardening: the bridge now wraps `json.encode(resp)` in pcall and falls back to a `lua_error` response if a handler ever returns something non-JSON-serializable (e.g. a userdata leaked from a `lua.exec` chunk). Without this, the encode would throw out of the main loop and crash the bridge.
 
