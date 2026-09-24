@@ -21,6 +21,8 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 
 # Run the bridge alone for debugging (server will attach instead of spawning)
 fceux --loadlua bridge.lua /path/to/some.nes
+# Windows (FCEUX's win32/win64 build): -lua, with the script's absolute path
+fceux64.exe -lua C:\path\to\bridge.lua C:\path\to\some.nes
 ```
 
 There is no automated test suite yet. End-to-end smoke tests are written ad-hoc as Python scripts in `/tmp/test-*.py` during development; the pattern is `spawn_fceux → wait_for_port → BridgeClient(...).call(...)` (all importable from `fceux_mcp.__main__`). The known test ROM used during bring-up is `/Users/ingvar/private/nes-test1/controller-test/controller-test.nes`.
@@ -33,7 +35,7 @@ Three processes:
 MCP client  ──MCP/stdio──▶  Python server  ──TCP/JSON-lines──▶  FCEUX + bridge.lua
 ```
 
-- **`bridge.lua`** runs *inside* FCEUX's embedded Lua 5.1 (loaded via `fceux --loadlua`). It dispatches JSON requests to FCEUX's `emu.*` / `memory.*` / `joypad.*` / `gui.*` libraries. Loads vendored LuaSocket from `vendor/luasocket/<platform>/` to get TCP support.
+- **`bridge.lua`** runs *inside* FCEUX's embedded Lua 5.1 (loaded via `fceux --loadlua`). It dispatches JSON requests to FCEUX's `emu.*` / `memory.*` / `joypad.*` / `gui.*` libraries. Loads vendored LuaSocket from `vendor/luasocket/<platform>/` to get TCP support; on Windows it uses the LuaSocket core that FCEUX's win32/win64 build preloads (`package.preload["socket.core"]`).
 - **`fceux_mcp/__main__.py`** is a single-file Python server using the official `mcp` SDK's FastMCP. On startup it probes the bridge port: if listening, attaches; otherwise spawns FCEUX. Owns the FCEUX subprocess lifecycle.
 - **`vendor/`** is intentionally checked in — pre-built LuaSocket binaries and `rxi/json.lua`. Don't add system-level dependencies that the user has to install separately; vendor them.
 
